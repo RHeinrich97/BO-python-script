@@ -1,0 +1,267 @@
+# ==============================================================================
+# FICHIER DE CONFIGURATION – Optimisation Bayésienne en Chimie
+# bo_chemistry.py  |  v3.3
+# ==============================================================================
+#
+# COMMENT UTILISER CE FICHIER
+# ----------------------------
+# 1. Copiez ce fichier et renommez-le pour votre campagne :
+#       cp config_template.yaml acylation_ball_mill.yaml
+#
+# 2. Remplissez les sections ci-dessous (cherchez les balises  <- MODIFIER)
+#
+# 3. Premier lancement :
+#       python bo_chemistry.py acylation_ball_mill.yaml
+#    -> Le CSV est cree automatiquement. Remplissez vos donnees initiales.
+#
+# 4. Relancez le script apres chaque serie d'experiences.
+#
+# SYNTAXE YAML RAPPEL
+# --------------------
+# - Les lignes commencant par # sont des commentaires (ignores)
+# - Les listes commencent par un tiret -
+# - Les valeurs numeriques N'ont PAS de guillemets : 60
+# - Les chaines de caracteres PEUVENT avoir des guillemets : "DMF"
+# - L'indentation (espaces) est significative -- n'utilisez pas de tabulations
+# ==============================================================================
+
+
+# == NOM DE LA CAMPAGNE ========================================================
+# <- MODIFIER
+
+campaign_name: "campagne_test"
+
+
+# == PARAMETRES D'ENTREE (VARIABLES EXPERIMENTALES) ===========================
+# <- MODIFIER
+#
+# Type "continuous"  :  name / type / min / max
+# Type "categorical" :  name / type / categories: ["A", "B", ...]
+
+parameters:
+  - name: "Temperature (C)"
+    type: continuous
+    min: 25
+    max: 80
+
+  - name: "Temps de reaction (min)"
+    type: continuous
+    min: 15
+    max: 120
+
+  - name: "Equivalents acyl chloride"
+    type: continuous
+    min: 1.0
+    max: 3.0
+
+  # ── Variables categorielles — encodage one-hot classique ─────────────────
+  # Utiliser quand les proprietes physicochimiques ne sont pas pertinentes
+  # (ligand de structure tres differente, categorie sans gradient chimique)
+  #
+  # - name: "Base"
+  #   type: categorical
+  #   categories: ["K2CO3", "Cs2CO3", "Et3N", "DBU", "DIPEA"]
+
+  # ── Variables categorielles — encodage physicochimique (RECOMMANDE) ──────
+  # Le GP utilise les proprietes numeriques au lieu d un one-hot encoding.
+  # Avantage : le GP comprend que DMF et DMAc sont similaires (epsilon proche)
+  # et peut interpoler / extrapoler a de nouveaux solvants non encore testes.
+  #
+  # descriptors_file    : chemin vers le fichier Excel (relatif au YAML)
+  # descriptors_sheet   : nom de la feuille (Solvants / Bases / Ligands)
+  # descriptors_columns : colonnes a utiliser comme features GP
+  #
+  # Recommandations par type :
+  #   Solvants : ["ε (25°C)", "μ (D)", "δP (MPa½)", "δH (MPa½)"]
+  #   Bases    : ["pKa (H₂O)", "Encombrement"]
+  #   Ligands  : ["TEP (cm⁻¹)", "%Vbur (3.5Å)"]
+  #
+  # - name: "Solvant"
+  #   type: categorical
+  #   categories: ["DMF", "THF", "MeCN", "Toluene", "EtOAc", "DCM"]
+  #   descriptors_file: "descripteurs_chimiques.xlsx"
+  #   descriptors_sheet: "Solvants"
+  #   descriptors_columns: ["ε (25°C)", "μ (D)", "δP (MPa½)", "δH (MPa½)"]
+
+  # - name: "Base"
+  #   type: categorical
+  #   categories: ["K2CO3", "Cs2CO3", "K3PO4", "Et3N", "DBU", "DIPEA"]
+  #   descriptors_file: "descripteurs_chimiques.xlsx"
+  #   descriptors_sheet: "Bases"
+  #   descriptors_columns: ["pKa (H₂O)", "Encombrement"]
+
+  # - name: "Ligand"
+  #   type: categorical
+  #   categories: ["PPh3", "PCy3", "PtBu3", "SPhos", "XPhos", "IPr"]
+  #   descriptors_file: "descripteurs_chimiques.xlsx"
+  #   descriptors_sheet: "Ligands"
+  #   descriptors_columns: ["TEP (cm⁻¹)", "%Vbur (3.5Å)"]
+
+
+# == VARIABLES DE SORTIE (OBJECTIFS) ==========================================
+# <- MODIFIER
+
+outputs:
+  - name: "Rendement (%)"
+    direction: maximize
+    weight: 1.0
+    # threshold: 70    # <- decommentez pour le mode threshold
+
+  # Exemples d'autres sorties (decommentez si besoin) :
+  # - name: "ee (%)"
+  #   direction: maximize
+  #   weight: 0.5
+
+  # - name: "Impuretes (%)"
+  #   direction: minimize
+  #   weight: 0.2
+  #   # threshold: 5
+
+
+# == PARAMETRES DE L'OPTIMISATION BAYESIENNE ==================================
+
+bo_settings:
+
+  n_suggestions: 2
+  seed: 42
+  min_initial_points: 6
+
+  # ── Fonction d'acquisition ────────────────────────────────────────────────
+  #
+  # "EI"       Expected Improvement
+  #            Recommande par defaut. Bon equilibre exploration/exploitation.
+  #            Parametre : xi (0.0 = exploitation pure, 0.1 = exploration)
+  #
+  # "TEI"      Tempered Expected Improvement (Lavayssiere, Bantreil, Lamaty 2026)
+  #            EI modifie par un facteur g(x,β) qui supprime l exploration
+  #            dans les zones deja bien exploitees (mu proche de y_best).
+  #            Advantage sur paysage multi-modal (plusieurs maxima locaux) :
+  #            evite de rester piege, continue d ameliorer quand EI stagne.
+  #            Recommande apres 10-15 iterations. Avant : EI suffit.
+  #            Parametres : xi (comme EI) + tei_beta (default 8, ne pas changer)
+  #
+  # "UCB"      Upper Confidence Bound
+  #            Controle via ucb_kappa. kappa eleve = plus d'exploration.
+  #            kappa=0.2 = exploitation pure  |  kappa=2.0 = equilibre
+  #
+  # "PI"       Probability of Improvement — conservateur, petites ameliorations.
+  #
+  # "Thompson" Thompson Sampling — recommande pour les batchs (n >= 2).
+  #            Declenche automatiquement en cas de stagnation.
+  #
+  # GUIDE PRATIQUE :
+  #   iterations 1-10  : EI  (GammaPriors stabilisent les hyperparametres, tout fonctionne)
+  #   iterations 10+   : TEI (commence a differencier les zones exploitees)
+  #   batch n >= 3     : EI-TS (plus rapide que Kriging Believer, diversite TS)
+  #   exploration auto : UCB-AUTO (beta auto-calibre, pas de kappa a regler)
+  #   exploration pure : VARMAX (maximise la variance, utile si stagnation forcee)
+  #   stagnation auto  : Thompson + n=3
+  #   derive auto      : UCB kappa=0.2
+  acquisition: "EI"
+  ucb_kappa: 2.0
+  xi: 0.01
+
+  # ── Parametres TEI (uniquement si acquisition = "TEI") ───────────────────
+  # tei_beta: 8          # Facteur de temperage. Valeur du papier, ne pas changer.
+
+  # ── Mode multi-objectif ───────────────────────────────────────────────────
+  #
+  # "weighted_sum" : somme ponderee des sorties (poids definis dans outputs)
+  # "pareto"       : front de Pareto sans poids a priori (ParEGO)
+  # "threshold"    : contrainte sur certaines sorties avant optimisation
+  # "ehvi"         : MC-EHVI, theoriquement superieur a pareto (3+ objectifs)
+  #                  plus lent (~5-90s/suggestion selon nombre d'objectifs)
+  multi_objective_mode: "weighted_sum"
+
+  # ── Qualite de l'optimisation ─────────────────────────────────────────────
+  # n_restarts : restarts de l'optimiseur local apres recherche globale
+  #   20 = rapide  |  50 = rigoureux (recommande)
+  # Note : l'optimiseur global (differential_evolution) tourne toujours,
+  # independamment de n_restarts.
+  n_restarts: 50
+
+  # ── Convergence ───────────────────────────────────────────────────────────
+  # Rounds consecutifs sans amelioration avant de declarer la convergence.
+  convergence_patience: 5
+
+  # ── Detection automatique de blocages ────────────────────────────────────
+  stagnation_detection: true
+  stagnation_patience: 3
+  stagnation_std_threshold: 0.05
+
+  drift_detection: true
+  drift_patience: 3
+  drift_slope_threshold: 0.03
+
+  # ── Normalisation MinMax de la sortie ────────────────────────────────────
+  # Recommande quand la distribution des rendements est asymetrique
+  # (beaucoup de valeurs basses, peu de valeurs hautes).
+  # Preserve le gradient vers l'optimum (contrairement a log1p).
+  # Desactive normalize_y=True interne du GP pour eviter la double compression.
+  boxcox: true
+
+  # ── Diversity filter (batch n >= 2) ─────────────────────────────────────
+  # Impose une distance minimale entre les suggestions du batch.
+  # Evite que n suggestions se regroupent autour du meme maximum local.
+  # Source : select_top_diverse_candidates (Lavayssiere et al. 2026)
+  diversity_filter: true
+  diversity_min_dist: 0.10   # Distance minimale normalisee [0,1] (0.10 pour n=2)
+
+  # ── Domain reduction (DESACTIVE par defaut — risque de maxima locaux) ───
+  # Resserre progressivement les bornes autour du meilleur point trouve.
+  # DANGER : si le meilleur point est un maximum local, le domaine va se
+  # restreindre autour de lui et l optimum global devient inaccessible.
+  # N utiliser qu en phase d affinage (> 15 iterations, bassin confirme).
+  domain_reduction: false
+  # reduction_factor: 0.8        # Resserre de 20% par iteration
+  # reduction_start_iter: 15     # Ne demarre pas avant cette iteration BO
+  # reduction_min_range: 0.30    # Plage minimale = 30% de la plage initiale
+
+  # ── Detection multi-modale ────────────────────────────────────────────────
+  # Detecte si l'espace d'acquisition a plusieurs zones prometteuses.
+  # Affiche les optima alternatifs dans le terminal (ne les force pas).
+  multimodal_detection: true
+
+  # ── Detection d'outliers ──────────────────────────────────────────────────
+  # Detecte les mesures experimentales aberrantes (residus GP > 3 sigma).
+  # Desactive par defaut (couteux : N fits GP supplementaires).
+  # outlier_detection: false
+  # outlier_n_sigma: 3.0
+
+  # ── Benchmark (lance avec --benchmark) ───────────────────────────────────
+  # Compare EI / UCB / PI / Thompson / Random sur vos donnees existantes.
+  benchmark_n_iter: 10
+  benchmark_n_rep: 5
+
+  # ── Options graphiques ────────────────────────────────────────────────────
+  # colorblind_mode: true    # palette dalton-friendly (Wong 2011)
+  # fig_dpi: 150             # 150 = defaut  |  200 = publication
+  # fig_width: 14            # largeur en pouces
+  # timestamp_outputs: false # true = horodatage dans les noms de fichiers
+
+  # ── EHVI (uniquement si multi_objective_mode = "ehvi") ────────────────────
+  # ehvi_n_mc: 64            # 32 = rapide  |  128 = rigoureux
+  # ref_point:
+  #   - 0.0
+  #   - 0.0
+
+  # ── LHS — points initiaux (lance avec --init-doe) ─────────────────────────
+  # doe_n_points: 9          # N auto si absent (2 x nb_params_continus + 1)
+  # init_method: "lhs"       # "lhs" (defaut) ou "kmeans"
+  #   lhs    : Latin Hypercube — uniforme, rapide, recommande en general
+  #   kmeans : clustering sur espace encode — meilleur si variables categorielles
+  #            encodees physicochimiquement (solvants, ligands)
+
+  # ── Encodage physicochimique (variables catégorielles) ───────────────────
+  # Si descriptors_file est spécifié pour une variable catégorielle dans
+  # la section parameters, le GP encode les catégories avec leurs valeurs
+  # physicochimiques au lieu d'un one-hot encoding.
+  # Le fichier descripteurs_chimiques.xlsx est fourni avec le script.
+  #
+  # Exemple dans la section parameters :
+  #   - name: "Solvant"
+  #     type: categorical
+  #     categories: ["DMF", "THF", "MeCN"]
+  #     descriptors_file: "descripteurs_chimiques.xlsx"
+  #     descriptors_sheet: "Solvants"
+  #     descriptors_columns: ["ε (25°C)", "μ (D)", "δP (MPa½)", "δH (MPa½)"]

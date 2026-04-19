@@ -1,0 +1,2849 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Apprendre la Bayesian Optimization — Guide de Chimiste</title>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,600;0,700;1,400;1,600&family=Source+Serif+4:ital,wght@0,300;0,400;0,600;1,300;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #faf6ef;
+  --paper2: #f2ece0;
+  --ink: #1a1410;
+  --ink2: #3d3020;
+  --muted: #8a7a60;
+  --border: #d4c8b0;
+  --amber: #b87333;
+  --amber-light: #f5e6d0;
+  --teal: #2a6b5e;
+  --teal-light: #d4ebe6;
+  --red: #8b3a2a;
+  --red-light: #f5e0db;
+  --blue: #2a4a7f;
+  --blue-light: #dce6f5;
+  --code-bg: #1a1410;
+  --code-text: #e8dfc8;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'Source Serif 4', serif;
+  font-weight: 300;
+  font-size: 16.5px;
+  line-height: 1.8;
+}
+
+/* ═══ SIDEBAR NAV ═══ */
+.sidebar {
+  position: fixed;
+  left: 0; top: 0;
+  width: 260px;
+  height: 100vh;
+  background: var(--ink);
+  color: var(--paper);
+  overflow-y: auto;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  padding: 36px 0;
+  transition: transform 0.3s;
+}
+
+.sidebar-logo {
+  padding: 0 28px 32px;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+  margin-bottom: 24px;
+}
+
+.sidebar-logo .tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin-bottom: 8px;
+}
+
+.sidebar-logo h1 {
+  font-family: 'Lora', serif;
+  font-size: 1.1rem;
+  font-weight: 600;
+  line-height: 1.4;
+  color: #f0e8d8;
+}
+
+.nav-chapter {
+  padding: 0 20px;
+  margin-bottom: 4px;
+}
+
+.nav-chapter a {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  text-decoration: none;
+  color: rgba(255,255,255,0.5);
+  font-size: 13px;
+  line-height: 1.4;
+  transition: all 0.2s;
+  font-family: 'Source Serif 4', serif;
+}
+
+.nav-chapter a:hover,
+.nav-chapter a.active {
+  background: rgba(255,255,255,0.08);
+  color: #f0e8d8;
+}
+
+.nav-chapter a.active { color: #d4a96a; }
+
+.nav-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--amber);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: 24px 28px 0;
+  border-top: 1px solid rgba(255,255,255,0.1);
+  font-size: 11px;
+  color: rgba(255,255,255,0.25);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ═══ MAIN ═══ */
+.main-wrap {
+  margin-left: 260px;
+  min-height: 100vh;
+}
+
+/* ═══ HERO ═══ */
+.hero {
+  background: var(--ink);
+  color: var(--paper);
+  padding: 100px 80px 80px;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  top: 0; right: 0;
+  width: 60%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 30px,
+    rgba(255,255,255,0.015) 30px,
+    rgba(255,255,255,0.015) 31px
+  );
+}
+
+.hero-eyebrow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin-bottom: 24px;
+  opacity: 0;
+  animation: up 0.5s 0.1s forwards;
+}
+
+.hero h1 {
+  font-family: 'Lora', serif;
+  font-size: clamp(2.4rem, 5vw, 4rem);
+  font-weight: 700;
+  line-height: 1.15;
+  max-width: 700px;
+  opacity: 0;
+  animation: up 0.5s 0.25s forwards;
+}
+
+.hero h1 em {
+  font-style: italic;
+  color: #d4a96a;
+}
+
+.hero-sub {
+  margin-top: 20px;
+  max-width: 560px;
+  color: rgba(240,232,216,0.65);
+  font-size: 16px;
+  line-height: 1.7;
+  opacity: 0;
+  animation: up 0.5s 0.4s forwards;
+}
+
+.hero-chips {
+  margin-top: 40px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  opacity: 0;
+  animation: up 0.5s 0.55s forwards;
+}
+
+.chip {
+  padding: 6px 14px;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 100px;
+  font-size: 12px;
+  color: rgba(240,232,216,0.6);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ═══ CHAPTERS ═══ */
+.chapter {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 80px 60px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chapter:last-of-type { border-bottom: none; }
+
+.ch-header {
+  margin-bottom: 44px;
+}
+
+.ch-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin-bottom: 12px;
+}
+
+.chapter h2 {
+  font-family: 'Lora', serif;
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+.chapter h3 {
+  font-family: 'Lora', serif;
+  font-size: 1.2rem;
+  font-weight: 600;
+  font-style: italic;
+  margin: 48px 0 16px;
+  color: var(--ink2);
+}
+
+p { margin-bottom: 20px; }
+
+strong { font-weight: 600; color: var(--ink); }
+
+em { font-style: italic; }
+
+/* ═══ RULE ═══ */
+.rule {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 48px 0;
+}
+
+/* ═══ CALLOUTS ═══ */
+.note {
+  display: flex;
+  gap: 16px;
+  padding: 20px 24px;
+  border-radius: 4px;
+  margin: 28px 0;
+  border: 1px solid;
+}
+
+.note.intuition {
+  background: var(--amber-light);
+  border-color: #d4a060;
+}
+.note.concept {
+  background: var(--teal-light);
+  border-color: #4a9e8a;
+}
+.note.warning {
+  background: var(--red-light);
+  border-color: #c05040;
+}
+.note.math {
+  background: var(--blue-light);
+  border-color: #5a7ab0;
+}
+
+.note-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.note-body { flex: 1; }
+
+.note-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+
+.note.intuition .note-label { color: var(--amber); }
+.note.concept   .note-label { color: var(--teal); }
+.note.warning   .note-label { color: var(--red); }
+.note.math      .note-label { color: var(--blue); }
+
+.note p { margin: 0; font-size: 14.5px; line-height: 1.7; }
+
+/* ═══ CODE ═══ */
+pre {
+  background: var(--code-bg);
+  color: var(--code-text);
+  border-radius: 6px;
+  padding: 28px;
+  overflow-x: auto;
+  margin: 28px 0;
+  position: relative;
+  font-size: 13px;
+  line-height: 1.85;
+  border: 1px solid rgba(255,255,255,0.05);
+}
+
+pre .lang {
+  position: absolute;
+  top: 10px; right: 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: rgba(255,255,255,0.2);
+}
+
+code { font-family: 'JetBrains Mono', monospace; }
+
+.kw  { color: #e0a070; }
+.fn  { color: #8ec8b0; }
+.str { color: #a8d080; }
+.cm  { color: #5a5040; font-style: italic; }
+.num { color: #d08060; }
+.cls { color: #d4b870; }
+.op  { color: #a08878; }
+
+code.i {
+  background: var(--paper2);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 13px;
+  color: var(--teal);
+}
+
+/* ═══ FORMULA ═══ */
+.formula-box {
+  background: var(--paper2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 28px 32px;
+  margin: 28px 0;
+  text-align: center;
+}
+
+.formula-eq {
+  font-family: 'Lora', serif;
+  font-size: 1.35rem;
+  font-style: italic;
+  color: var(--ink2);
+  margin-bottom: 16px;
+}
+
+.formula-legend {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.7;
+  text-align: left;
+  max-width: 480px;
+  margin: 0 auto;
+}
+
+.formula-legend span {
+  font-family: 'Lora', serif;
+  font-style: italic;
+  color: var(--ink2);
+}
+
+/* ═══ TABLE ═══ */
+.tbl-wrap { overflow-x: auto; margin: 28px 0; }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+
+thead tr { border-bottom: 2px solid var(--amber); }
+
+th {
+  padding: 10px 14px;
+  text-align: left;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--amber);
+  font-weight: 500;
+}
+
+td { padding: 11px 14px; border-bottom: 1px solid var(--border); }
+tr:hover td { background: var(--paper2); }
+
+.tag-teal   { display:inline-block; padding:2px 8px; border-radius:3px; font-family:'JetBrains Mono',monospace; font-size:10px; background:var(--teal-light); color:var(--teal); }
+.tag-amber  { display:inline-block; padding:2px 8px; border-radius:3px; font-family:'JetBrains Mono',monospace; font-size:10px; background:var(--amber-light); color:var(--amber); }
+.tag-blue   { display:inline-block; padding:2px 8px; border-radius:3px; font-family:'JetBrains Mono',monospace; font-size:10px; background:var(--blue-light); color:var(--blue); }
+
+/* ═══ WORKFLOW STEPS ═══ */
+.steps { margin: 36px 0; }
+
+.step {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 20px;
+  position: relative;
+  padding-bottom: 32px;
+}
+
+.step:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  left: 25px; top: 52px;
+  width: 2px;
+  height: calc(100% - 32px);
+  background: linear-gradient(180deg, var(--amber) 0%, var(--border) 100%);
+}
+
+.step-circle {
+  width: 52px; height: 52px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: #d4a96a;
+  font-family: 'Lora', serif;
+  font-size: 1.1rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+
+.step-body { padding-top: 12px; }
+.step-title { font-weight: 600; color: var(--ink); margin-bottom: 6px; font-size: 15px; }
+.step-desc  { font-size: 14px; color: var(--muted); line-height: 1.65; margin: 0; }
+
+/* ═══ GP INTERACTIVE ═══ */
+.gp-demo {
+  background: var(--ink);
+  border-radius: 8px;
+  padding: 28px;
+  margin: 32px 0;
+}
+
+.gp-demo-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: #d4a96a;
+  margin-bottom: 16px;
+}
+
+#gp-canvas {
+  width: 100%;
+  cursor: crosshair;
+  display: block;
+  border-radius: 4px;
+}
+
+.gp-controls {
+  display: flex;
+  gap: 12px;
+  margin-top: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.gp-btn {
+  padding: 7px 16px;
+  border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.06);
+  color: rgba(240,232,216,0.7);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+  letter-spacing: 1px;
+}
+
+.gp-btn:hover { background: rgba(255,255,255,0.12); color: #f0e8d8; }
+.gp-btn.primary { background: #b87333; border-color: #b87333; color: white; }
+.gp-btn.primary:hover { background: #d4884a; }
+
+.gp-status {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: rgba(255,255,255,0.3);
+  margin-left: auto;
+}
+
+.gp-legend {
+  display: flex;
+  gap: 20px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.gp-leg-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: rgba(255,255,255,0.35);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.gp-leg-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+}
+
+.gp-leg-line {
+  width: 20px; height: 3px;
+  border-radius: 2px;
+}
+
+/* ═══ ACQF CARDS ═══ */
+.acqf-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin: 28px 0;
+}
+
+.acqf-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 20px;
+  background: var(--paper2);
+  transition: border-color 0.2s;
+}
+
+.acqf-card:hover { border-color: var(--amber); }
+.acqf-card.recommended { border-color: var(--teal); background: var(--teal-light); }
+
+.acqf-abbr {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--amber);
+  margin-bottom: 4px;
+}
+
+.acqf-card.recommended .acqf-abbr { color: var(--teal); }
+
+.acqf-name { font-weight: 600; font-size: 14px; margin-bottom: 8px; }
+.acqf-body { font-size: 13px; color: var(--muted); line-height: 1.6; }
+
+/* ═══ PARETO VIZ ═══ */
+.pareto-wrap {
+  background: var(--paper2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 24px;
+  margin: 28px 0;
+}
+
+.pareto-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin-bottom: 16px;
+}
+
+/* ═══ CHECKLIST ═══ */
+.checklist { list-style: none; margin: 16px 0; }
+.checklist li {
+  display: flex;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 14.5px;
+  align-items: flex-start;
+}
+.checklist li:last-child { border-bottom: none; }
+.checklist li::before {
+  content: '→';
+  color: var(--amber);
+  font-family: 'JetBrains Mono', monospace;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+/* ═══ PROGRESS BAR ═══ */
+.reading-bar {
+  position: fixed;
+  top: 0; left: 260px; right: 0;
+  height: 2px;
+  background: var(--border);
+  z-index: 200;
+}
+
+.reading-fill {
+  height: 100%;
+  background: var(--amber);
+  width: 0%;
+  transition: width 0.1s;
+}
+
+/* ═══ MOBILE TOGGLE ═══ */
+.sidebar-toggle {
+  display: none;
+  position: fixed;
+  top: 16px; left: 16px;
+  z-index: 300;
+  background: var(--ink);
+  color: var(--paper);
+  border: none;
+  width: 40px; height: 40px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 18px;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ═══ ANIMATION ═══ */
+@keyframes up {
+  from { opacity:0; transform: translateY(14px); }
+  to   { opacity:1; transform: translateY(0); }
+}
+
+/* ═══ RESPONSIVE ═══ */
+@media (max-width: 900px) {
+  .sidebar {
+    transform: translateX(-100%);
+  }
+  .sidebar.open {
+    transform: translateX(0);
+  }
+  .main-wrap { margin-left: 0; }
+  .reading-bar { left: 0; }
+  .sidebar-toggle { display: flex; }
+  .hero, .chapter { padding: 60px 28px; }
+  .acqf-grid { grid-template-columns: 1fr; }
+}
+
+/* ═══ CSV HIGHLIGHT TABLE ═══ */
+.csv-demo { overflow-x:auto; margin:28px 0; border-radius:6px; border:1px solid var(--border); }
+.csv-demo table { font-family:'JetBrains Mono',monospace; font-size:12px; width:100%; }
+.csv-demo thead tr { background: var(--ink); }
+.csv-demo th { color: var(--amber); font-size:10px; letter-spacing:1px; padding:10px 12px; text-align:left; }
+.csv-demo td { padding:9px 12px; border-bottom:1px solid var(--border); font-size:12px; }
+.csv-demo tr:hover td { background: var(--paper2); }
+.col-param  th { color: #8ec8b0; }
+.col-output th { color: #d4a96a; }
+.col-meta   th { color: #9090c0; }
+td.param  { color: var(--teal); font-weight:500; }
+td.output { color: var(--amber); font-weight:500; }
+td.meta   { color: var(--blue); font-weight:500; }
+td.v-fait    { color:#2a6b5e; font-weight:700; }
+td.v-suggere { color:#b87333; font-weight:700; }
+td.v-empty   { color:var(--border); font-style:italic; }
+.row-bo { background: rgba(42,106,94,0.04); }
+
+/* ═══ COMMAND BLOCK ═══ */
+.cmd { background:var(--ink); color:#8ec8b0; border-radius:6px; padding:16px 20px;
+       font-family:'JetBrains Mono',monospace; font-size:13px; margin:20px 0;
+       display:flex; align-items:center; gap:12px; }
+.cmd::before { content:'$'; color:var(--amber); font-weight:700; flex-shrink:0; }
+.cmd.note-cmd { background: var(--paper2); color: var(--teal); border:1px solid var(--teal-light); }
+.cmd.note-cmd::before { color: var(--teal); }
+
+/* ═══ YAML BLOCK ═══ */
+.yaml-section { margin:28px 0; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+.yaml-section-header { background:var(--paper2); padding:10px 20px;
+  font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:2px;
+  text-transform:uppercase; color:var(--amber); border-bottom:1px solid var(--border); }
+
+/* ═══ WORKFLOW PILLS ═══ */
+.pill { display:inline-flex; align-items:center; gap:6px; padding:4px 12px;
+  border-radius:100px; font-family:'JetBrains Mono',monospace; font-size:11px;
+  font-weight:500; border:1px solid; }
+.pill-green  { background:var(--teal-light);   border-color:var(--teal);  color:var(--teal); }
+.pill-amber  { background:var(--amber-light);  border-color:var(--amber); color:var(--amber); }
+.pill-blue   { background:var(--blue-light);   border-color:var(--blue);  color:var(--blue); }
+.pill-red    { background:var(--red-light);    border-color:var(--red);   color:var(--red); }
+
+</style>
+</head>
+
+<body>
+
+<div class="reading-bar"><div class="reading-fill" id="prog"></div></div>
+<button class="sidebar-toggle" onclick="document.querySelector('.sidebar').classList.toggle('open')">☰</button>
+
+<!-- ════════ SIDEBAR -->
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="tag">// Guide d'apprentissage</div>
+    <h1>Bayesian Optimization<br>en Chimie</h1>
+  </div>
+  <div class="nav-chapter"><a href="#intro" class="active"><span class="nav-num">00</span>Introduction</a></div>
+  <div class="nav-chapter"><a href="#ch1"><span class="nav-num">01</span>L'intuition fondamentale</a></div>
+  <div class="nav-chapter"><a href="#ch2"><span class="nav-num">02</span>Structurer ses données</a></div>
+  <div class="nav-chapter"><a href="#ch3"><span class="nav-num">03</span>Le modèle surrogate (GP)</a></div>
+  <div class="nav-chapter"><a href="#ch4"><span class="nav-num">04</span>La fonction d'acquisition</a></div>
+  <div class="nav-chapter"><a href="#ch5"><span class="nav-num">05</span>Configurer sa campagne</a></div>
+  <div class="nav-chapter"><a href="#ch6"><span class="nav-num">06</span>Workflow pas à pas</a></div>
+  <div class="nav-chapter"><a href="#ch7"><span class="nav-num">07</span>Lire ses graphiques</a></div>
+  <div class="nav-chapter"><a href="#ch8"><span class="nav-num">08</span>Multi-objectif</a></div>
+  <div class="nav-chapter"><a href="#ch9"><span class="nav-num">09</span>Convergence &amp; benchmark</a></div>
+  <div class="nav-chapter"><a href="#ch10"><span class="nav-num">10</span>Nouvelles features v2.4</a></div>
+  <div class="nav-chapter"><a href="#ch11"><span class="nav-num">11</span>Stagnation v2.5</a></div>
+  <div class="nav-chapter"><a href="#ch12"><span class="nav-num">12</span>Dérive &amp; LHS v2.6</a></div>
+  <div class="nav-chapter"><a href="#ch13"><span class="nav-num">13</span>Acquisitions — Guide pratique</a></div>
+  <div class="nav-chapter"><a href="#ch14"><span class="nav-num">14</span>Bruit, Box-Cox &amp; Multi-modalité</a></div>
+  <div class="nav-chapter"><a href="#ch15"><span class="nav-num">15</span>Dashboard &amp; PDP — v3.0</a></div>
+  <div class="nav-chapter"><a href="#ch16"><span class="nav-num">16</span>Encodage physicochimique — v3.0</a></div>
+  <div class="nav-chapter"><a href="#ch17"><span class="nav-num">17</span>Nouvelles acquisitions — v3.2</a></div>
+  <div class="nav-chapter"><a href="#ch18"><span class="nav-num">18</span>Architecture GPyTorch — v3.3</a></div>
+  <div class="sidebar-footer">
+    bo_chemistry.py v2.9<br>
+    Python 3.10+ · scikit-learn
+  </div>
+</nav>
+
+<div class="main-wrap">
+
+<!-- ══ HERO -->
+<header class="hero" id="intro">
+  <div class="hero-eyebrow">// Guide d'apprentissage progressif — v2.9</div>
+  <h1>L'Optimisation Bayésienne<br>pour le <em>Chimiste</em></h1>
+  <p class="hero-sub">
+    De tes premières données expérimentales à un système qui te suggère intelligemment quoi tester ensuite — sans PyTorch, sans serveur, juste un fichier YAML, un CSV et un script Python.
+  </p>
+  <div class="hero-chips">
+    <div class="chip">intuition d'abord</div>
+    <div class="chip">exemples concrets</div>
+    <div class="chip">variables mixtes</div>
+    <div class="chip">multi-objectif + EHVI</div>
+    <div class="chip">convergence auto</div>
+    <div class="chip">benchmark intégré</div>
+    <div class="chip">explain suggestion</div>
+    <div class="chip">palette daltonien</div>
+    <div class="chip">stagnation auto</div>
+    <div class="chip">dérive directionnelle</div>
+    <div class="chip">LHS init-doe</div>
+    <div class="chip">outlier detection</div>
+    <div class="chip">Box-Cox · multi-modal</div>
+    <div class="chip">dashboard 16:9</div>
+    <div class="chip">PDP · encodage physico</div>
+    <div class="chip">EI-TS · UCB-auto · k-means</div>
+    <div class="chip">GPyTorch · GammaPriors</div>
+  </div>
+</header>
+
+<!-- ══ CH 1 : INTUITION -->
+<section class="chapter" id="ch1">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 01</div>
+    <h2>L'intuition fondamentale</h2>
+  </div>
+
+  <p>Avant d'écrire une ligne de code ou de voir une formule, posons-nous la vraie question : <strong>pourquoi a-t-on besoin de ça&nbsp;?</strong></p>
+  <p>Imagine une réaction d'acylation en ball-mill. Tu joues sur trois paramètres : température, temps de réaction, équivalents d'acyl chloride. Si tu testes 10 valeurs par paramètre, ça fait 10³ = <strong>1 000 réactions</strong>. La Bayesian Optimization (BO) arrive souvent à de très bonnes conditions en <strong>15–30 expériences</strong>.</p>
+
+  <div class="note intuition">
+    <div class="note-icon">🏔</div>
+    <div class="note-body">
+      <div class="note-label">// L'analogie de la montagne</div>
+      <p>Chercher le meilleur rendement, c'est comme trouver le sommet d'une montagne dans le brouillard. À chaque pas tu mets à jour une <strong>carte mentale du terrain</strong>. La BO fait ça rigoureusement : elle estime la topographie complète à partir de tes quelques mesures, et te suggère l'endroit le plus prometteur à explorer ensuite.</p>
+    </div>
+  </div>
+
+  <h3>Le cycle en cinq temps</h3>
+  <div class="steps">
+    <div class="step"><div class="step-circle">1</div><div class="step-body"><div class="step-title">Expériences initiales</div><p class="step-desc">Tu réalises quelques expériences couvrant l'espace (OFAT ou aléatoires). Règle : au moins 2 × (nombre de paramètres). Pour 3 paramètres → 6 expériences minimum.</p></div></div>
+    <div class="step"><div class="step-circle">2</div><div class="step-body"><div class="step-title">Entraîner le modèle surrogate (GP)</div><p class="step-desc">Un Processus Gaussien (GP) apprend la relation conditions → résultats. Il prédit non seulement une valeur, mais aussi son <strong>incertitude</strong> — là où il a des données vs là où il ne sait pas.</p></div></div>
+    <div class="step"><div class="step-circle">3</div><div class="step-body"><div class="step-title">Calculer la fonction d'acquisition</div><p class="step-desc">Un score est calculé pour chaque point non testé, combinant prédiction (exploitation) et incertitude (exploration). Le script maximise ce score pour trouver la meilleure suggestion.</p></div></div>
+    <div class="step"><div class="step-circle">4</div><div class="step-body"><div class="step-title">Aller au labo</div><p class="step-desc">Tu testes les conditions suggérées, tu mesures le résultat, tu le rentres dans le CSV.</p></div></div>
+    <div class="step"><div class="step-circle">5</div><div class="step-body"><div class="step-title">Mettre à jour et recommencer</div><p class="step-desc">Le nouveau point est ajouté au dataset, le GP est ré-entraîné, la prochaine suggestion est meilleure. La convergence est détectée automatiquement.</p></div></div>
+  </div>
+
+  <div class="note concept">
+    <div class="note-icon">💡</div>
+    <div class="note-body">
+      <div class="note-label">// Pourquoi c'est mieux qu'OFAT</div>
+      <p>OFAT varie un paramètre à la fois et suppose qu'ils sont <strong>indépendants</strong>. La BO explore les <strong>interactions</strong> : "est-ce que l'effet de la température dépend du solvant ?" Ces interactions sont souvent cruciales en chimie.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══ CH 2 : DONNÉES -->
+<section class="chapter" id="ch2">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 02</div>
+    <h2>Structurer ses données chimiques</h2>
+  </div>
+
+  <p>Le script <code class="i">bo_chemistry.py</code> lit et écrit <strong>un seul fichier CSV</strong> — toute la campagne vit dedans. Voici comment il est structuré.</p>
+
+  <h3>Les variables d'entrée (paramètres)</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Type</th><th>Exemple</th><th>Déclaration YAML</th><th>Traitement interne</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag-teal">Continue</span></td><td>Température 25–80 °C</td><td><code class="i">type: continuous · min/max</code></td><td>Normalisé dans [0, 1]</td></tr>
+      <tr><td><span class="tag-teal">Continue</span></td><td>Équivalents 1.0–3.0</td><td><code class="i">type: continuous · min/max</code></td><td>Normalisé dans [0, 1]</td></tr>
+      <tr><td><span class="tag-amber">Catégorielle</span></td><td>Ligand : PPh3, BINAP…</td><td><code class="i">type: categorical · categories</code></td><td>Encodage ordinal [0, 1]</td></tr>
+      <tr><td><span class="tag-amber">Catégorielle</span></td><td>Solvant : DMF, THF…</td><td><code class="i">type: categorical · categories</code></td><td>Encodage ordinal [0, 1]</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Le format CSV — colonnes obligatoires</h3>
+
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// Règles absolues</div>
+      <p>Les noms de colonnes doivent être <strong>identiques</strong> (majuscules, espaces, accents) à ce qui est déclaré dans le YAML. La moindre différence provoque une erreur. Ne supprimez jamais une colonne. Ne réordonnez pas les colonnes.</p>
+    </div>
+  </div>
+
+  <div class="csv-demo">
+    <table>
+      <thead>
+        <tr>
+          <th colspan="3" style="background:#1a3a2e;color:#8ec8b0;padding:8px 12px;font-size:10px;letter-spacing:2px;">PARAMÈTRES (vos conditions)</th>
+          <th colspan="2" style="background:#3a2a0a;color:#d4a96a;padding:8px 12px;font-size:10px;letter-spacing:2px;">SORTIES (vos mesures)</th>
+          <th colspan="3" style="background:#1a1a3a;color:#9090c0;padding:8px 12px;font-size:10px;letter-spacing:2px;">GESTION (auto)</th>
+        </tr>
+        <tr>
+          <th>Temperature (C)</th><th>Temps de reaction (min)</th><th>Equivalents</th>
+          <th>Rendement (%)</th><th>ee (%)</th>
+          <th>statut</th><th>iteration_BO</th><th>prediction_BO</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="param">40</td><td class="param">30</td><td class="param">1.5</td>
+          <td class="output">22</td><td class="output">75</td>
+          <td class="v-fait">fait</td><td class="v-empty">vide</td><td class="v-empty">vide</td>
+        </tr>
+        <tr>
+          <td class="param">60</td><td class="param">60</td><td class="param">2.0</td>
+          <td class="output">78</td><td class="output">91</td>
+          <td class="v-fait">fait</td><td class="v-empty">vide</td><td class="v-empty">vide</td>
+        </tr>
+        <tr class="row-bo">
+          <td class="param">63.84</td><td class="param">72.15</td><td class="param">2.18</td>
+          <td class="output">83</td><td class="output">89</td>
+          <td class="v-fait">fait</td><td class="meta">1</td><td class="meta">80.12</td>
+        </tr>
+        <tr class="row-bo">
+          <td class="param">74.10</td><td class="param">65.80</td><td class="param">2.41</td>
+          <td class="v-empty">—</td><td class="v-empty">—</td>
+          <td class="v-suggere">suggere</td><td class="meta">2</td><td class="meta">89.30</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note concept">
+    <div class="note-icon">📌</div>
+    <div class="note-body">
+      <div class="note-label">// Signification des colonnes de gestion</div>
+      <p><strong>statut</strong> : écrivez <code class="i">fait</code> pour chaque expérience terminée. Le script ignore les lignes sans ce statut.<br>
+      <strong>iteration_BO</strong> : remplie automatiquement (numéro du round BO).<br>
+      <strong>prediction_BO</strong> : remplie automatiquement — ce que le GP prédisait au moment de la suggestion. Utile pour lire les graphiques.</p>
+    </div>
+  </div>
+
+  <h3>À propos de la régiosélectivité</h3>
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// Piège classique</div>
+      <p>Le ratio r.r. n'est <strong>pas</strong> linéaire. La différence entre 2:1 et 10:1 est bien plus significative que entre 90:1 et 100:1. Si tu veux optimiser la régiosélectivité, utilise <strong>ln(ratio)</strong> comme valeur dans le CSV plutôt que le ratio brut. Le GP apprendra beaucoup mieux.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══ CH 3 : GP -->
+<section class="chapter" id="ch3">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 03</div>
+    <h2>Le modèle surrogate : le Processus Gaussien</h2>
+  </div>
+
+  <p>Le cœur de la BO est le <strong>Processus Gaussien (GP)</strong>. Sa particularité : il prédit non pas une valeur fixe, mais <strong>une distribution</strong> — une moyenne μ(x) et une variance σ²(x).</p>
+
+  <div class="note intuition">
+    <div class="note-icon">🎲</div>
+    <div class="note-body">
+      <div class="note-label">// Intuition</div>
+      <p>Un collègue honnête ne dit pas "exactement 73.4 %". Il dit <em>"entre 65 et 80 %, je pense autour de 72"</em>. Le GP est ce collègue honnête. Et sa barre d'erreur est <strong>petite là où il a des données, grande là où il explore</strong>.</p>
+    </div>
+  </div>
+
+  <h3>Démo interactive — Ajoute des points, observe le GP</h3>
+  <div class="gp-demo">
+    <div class="gp-demo-title">// Processus Gaussien — Cliquer pour ajouter une observation</div>
+    <canvas id="gp-canvas" height="220"></canvas>
+    <div class="gp-controls">
+      <button class="gp-btn primary" onclick="resetGP()">Réinitialiser</button>
+      <button class="gp-btn" onclick="addRandomPoint()">Point aléatoire</button>
+      <button class="gp-btn" onclick="suggestNext()">Suggérer le prochain →</button>
+      <span class="gp-status" id="gp-status">0 observations</span>
+    </div>
+    <div class="gp-legend">
+      <div class="gp-leg-item"><div class="gp-leg-dot" style="background:#d4a96a;"></div>Observations</div>
+      <div class="gp-leg-item"><div class="gp-leg-line" style="background:#8ec8b0;"></div>Prédiction GP (μ)</div>
+      <div class="gp-leg-item"><div class="gp-leg-line" style="background:rgba(142,200,176,0.25);height:10px;"></div>Incertitude (±2σ)</div>
+      <div class="gp-leg-item"><div class="gp-leg-line" style="background:#e07050;border-style:dashed;"></div>Vraie fonction (inconnue)</div>
+      <div class="gp-leg-item"><div class="gp-leg-dot" style="background:none;border:2px solid #c060c0;width:12px;height:12px;"></div>Prochain suggéré (EI max)</div>
+    </div>
+  </div>
+
+  <h3>Le kernel Matérn 5/2 et les lengthscales ARD</h3>
+  <p>Le script utilise un kernel <strong>Matérn 5/2</strong> avec ARD (Automatic Relevance Determination) : une lengthscale ℓᵢ par dimension.</p>
+
+  <div class="formula-box">
+    <div class="formula-eq">k(x, x') = σ²(1 + √5·d + 5d²/3) · exp(−√5·d)</div>
+    <div class="formula-legend">
+      où <span>d</span> = √Σᵢ (xᵢ − x'ᵢ)² / ℓᵢ²<br><br>
+      <strong>Ce qu'il faut retenir :</strong> une <em>petite</em> lengthscale ℓᵢ → le rendement varie vite avec ce paramètre → <strong>paramètre très influent</strong>. C'est cette information que le script utilise pour choisir les axes des graphiques de paysage GP (les 2 paramètres aux ℓ les plus courts).
+    </div>
+  </div>
+
+  <div class="note concept">
+    <div class="note-icon">🔬</div>
+    <div class="note-body">
+      <div class="note-label">// Ce que ça dit sur ta chimie</div>
+      <p>Si le type de ligand ressort avec une petite lengthscale, c'est une information mécanistique : <strong>le ligand est le levier principal</strong>. Si la température a une grande lengthscale, la réaction est peu sensible à la température dans ta plage — tu peux peut-être la fixer.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══ CH 4 : ACQUISITION -->
+<section class="chapter" id="ch4">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 04</div>
+    <h2>La fonction d'acquisition</h2>
+  </div>
+
+  <p>La fonction d'acquisition α(x) répond à : <em>"où est-ce que j'ai le plus de chances de faire mieux que mon meilleur résultat actuel ?"</em> Elle équilibre <strong>exploitation</strong> (zones prometteuses) et <strong>exploration</strong> (zones inconnues).</p>
+
+  <div class="formula-box">
+    <div class="formula-eq">EI(x) = (μ(x) − f*) · Φ(z) + σ(x) · φ(z)</div>
+    <div class="formula-legend">
+      où <span>z</span> = (μ(x) − f*) / σ(x), <span>f*</span> est le meilleur résultat observé,<br>
+      <span>Φ</span> = CDF normale, <span>φ</span> = PDF normale.<br><br>
+      Premier terme : exploitation (zones où μ est haut). Second terme : exploration (zones où σ est haut). EI = 0 aux points déjà observés.
+    </div>
+  </div>
+
+  <div class="acqf-grid">
+    <div class="acqf-card recommended">
+      <div class="acqf-abbr">EI</div>
+      <div class="acqf-name">Expected Improvement</div>
+      <div class="acqf-body"><strong>Recommandé par défaut.</strong> Équilibre naturel exploration/exploitation. Paramètre <code class="i">xi</code> : 0.01 (exploitation) → 0.1 (exploration).</div>
+    </div>
+    <div class="acqf-card">
+      <div class="acqf-abbr">UCB</div>
+      <div class="acqf-name">Upper Confidence Bound</div>
+      <div class="acqf-body">Score = μ + κ·σ. Contrôle direct via <code class="i">ucb_kappa</code> : κ=1 exploite, κ=3 explore. Utile en début de campagne.</div>
+    </div>
+    <div class="acqf-card">
+      <div class="acqf-abbr">PI</div>
+      <div class="acqf-name">Probability of Improvement</div>
+      <div class="acqf-body">Probabilité de battre f*. Plus conservateur qu'EI. Faire des petits gains sûrs plutôt que des grands sauts risqués.</div>
+    </div>
+    <div class="acqf-card">
+      <div class="acqf-abbr">Thompson</div>
+      <div class="acqf-name">Thompson Sampling</div>
+      <div class="acqf-body">Tire un scénario aléatoire du posterior GP. <strong>Meilleur choix pour les batchs</strong> (<code class="i">n_suggestions ≥ 2</code>). Diversité naturelle.</div>
+    </div>
+  </div>
+
+  <div class="note concept">
+    <div class="note-icon">🧭</div>
+    <div class="note-body">
+      <div class="note-label">// Stratégie recommandée</div>
+      <p><strong>Début de campagne</strong> (itérations 1–5) : UCB avec κ=2.5 ou EI avec ξ=0.05 — explore plus.<br>
+      <strong>Milieu</strong> (itérations 6–15) : EI par défaut (ξ=0.01) — équilibre.<br>
+      <strong>Fin</strong> (raffinement) : EI ou PI avec ξ=0.001 — exploite.<br>
+      <strong>Batch ≥ 2</strong> : Thompson — diversité automatique.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══ CH 5 : CONFIGURATION -->
+<section class="chapter" id="ch5">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 05</div>
+    <h2>Configurer sa campagne — <code style="font-size:1.4rem;">config_test.yaml</code></h2>
+  </div>
+
+  <p>Toute la logique de ta campagne vit dans un fichier YAML. Tu ne touches jamais au code Python. Voici les quatre sections, expliquées.</p>
+
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// Rappel syntaxe YAML</div>
+      <p>L'indentation (espaces) est <strong>significative</strong>. N'utilisez jamais de tabulations. Les valeurs numériques n'ont <strong>pas</strong> de guillemets : <code class="i">60</code>. Les chaînes de caractères peuvent en avoir : <code class="i">"DMF"</code>. Les commentaires commencent par <code class="i">#</code>.</p>
+    </div>
+  </div>
+
+  <h3>Section 1 — Identité de la campagne</h3>
+<pre><span class="lang">YAML</span><code>campaign_name: <span class="str">"acylation_ball_mill_v1"</span>
+<span class="cm"># Définit le nom du CSV généré : acylation_ball_mill_v1.csv
+# Règles : pas d'espaces ni caractères spéciaux — utilisez _ ou -
+# Chaque campagne = un YAML + un CSV. Jamais de modification du code.</span>
+</code></pre>
+
+  <h3>Section 2 — Paramètres expérimentaux</h3>
+<pre><span class="lang">YAML</span><code>parameters:
+
+  <span class="cm"># ── Variables continues (température, temps, concentration...) ──</span>
+  - name: <span class="str">"Temperature (C)"</span>      <span class="cm"># nom EXACT de la colonne dans le CSV</span>
+    type: continuous
+    min: <span class="num">25</span>
+    max: <span class="num">80</span>
+
+  <span class="cm"># ── Variables catégorielles (ligand, solvant, base...) ──────────</span>
+  - name: <span class="str">"Ligand"</span>
+    type: categorical
+    categories: [<span class="str">"PPh3"</span>, <span class="str">"BINAP"</span>, <span class="str">"Xantphos"</span>, <span class="str">"dppf"</span>]
+    <span class="cm"># IMPORTANT : les noms doivent correspondre exactement au CSV</span>
+</code></pre>
+
+  <h3>Section 3 — Variables de sortie (objectifs)</h3>
+<pre><span class="lang">YAML</span><code>outputs:
+  - name: <span class="str">"Rendement (%)"</span>     <span class="cm"># nom EXACT de la colonne dans le CSV</span>
+    direction: maximize    <span class="cm"># maximize ou minimize</span>
+    weight: <span class="num">1.0</span>           <span class="cm"># importance relative (normalisée automatiquement)</span>
+
+  <span class="cm"># Avec plusieurs sorties :</span>
+  - name: <span class="str">"ee (%)"</span>
+    direction: maximize
+    weight: <span class="num">0.4</span>
+    <span class="cm"># threshold: 90   ← décommentez pour le mode threshold</span>
+</code></pre>
+
+  <h3>Section 4 — Réglages BO</h3>
+<pre><span class="lang">YAML</span><code>bo_settings:
+  n_suggestions: <span class="num">2</span>          <span class="cm"># expériences suggérées par lancement (1–4)</span>
+  acquisition: <span class="str">"EI"</span>         <span class="cm"># EI | UCB | PI | Thompson</span>
+  ucb_kappa: <span class="num">2.0</span>            <span class="cm"># exploration UCB (1=exploit, 3=explore)</span>
+  xi: <span class="num">0.01</span>                  <span class="cm"># jitter EI/PI (0.001=exploit, 0.1=explore)</span>
+  multi_objective_mode: <span class="str">"weighted_sum"</span>   <span class="cm"># weighted_sum | pareto | threshold | ehvi</span>
+  min_initial_points: <span class="num">6</span>   <span class="cm"># avertissement si insuffisant</span>
+  n_restarts: <span class="num">20</span>           <span class="cm"># qualité optimisation (20=rapide, 50=rigoureux)</span>
+  seed: <span class="num">42</span>                 <span class="cm"># reproductibilité</span>
+
+  <span class="cm"># ── Convergence ─────────────────────────────────────────────────</span>
+  convergence_patience: <span class="num">5</span>  <span class="cm"># rounds BO sans amélioration → graphiques FINAL générés</span>
+                            <span class="cm"># 5 est la valeur recommandée en chimie (Shields, JACS 2021)</span>
+
+  <span class="cm"># ── Benchmark (optionnel) ───────────────────────────────────────</span>
+  benchmark_n_iter: <span class="num">10</span>     <span class="cm"># itérations simulées par fonction d'acquisition</span>
+  benchmark_n_rep: <span class="num">5</span>       <span class="cm"># répétitions pour la courbe moyenne ± std</span>
+
+  <span class="cm"># ── EHVI uniquement ─────────────────────────────────────────────</span>
+  <span class="cm"># ehvi_n_mc: 64            # échantillons MC (32=rapide, 128=rigoureux)</span>
+  <span class="cm"># ref_point:               # auto-calculé si absent</span>
+  <span class="cm">#   - 0.0                  # valeur de référence pour Rendement (%)</span>
+  <span class="cm">#   - 0.0                  # valeur de référence pour ee (%)</span>
+</code></pre>
+
+  <span class="cm">  # ── Options graphiques (nouvelles — v2.4) ──────────────────────</span>
+  <span class="cm">  # colorblind_mode: true    # palette Wong 2011 dalton-friendly</span>
+  <span class="cm">  # fig_dpi: 150             # 150=normal · 200=publication · 100=brouillon</span>
+  <span class="cm">  # fig_width: 14            # largeur figures en pouces</span>
+  <span class="cm">  # timestamp_outputs: false # YYYYMMDD_HHMMSS_ prefix sur les fichiers</span>
+</section>
+
+<!-- ══ CH 6 : WORKFLOW -->
+<section class="chapter" id="ch6">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 06</div>
+    <h2>Workflow pas à pas avec <code style="font-size:1.4rem;">bo_chemistry.py</code></h2>
+  </div>
+
+  <p>Voici le cycle complet, de l'installation à la convergence.</p>
+
+  <h3>Installation</h3>
+<pre><span class="lang">bash</span><code>pip install numpy pandas scipy scikit-learn pyyaml matplotlib</code></pre>
+  <p>Aucune dépendance à PyTorch, BoTorch ou GPU. Fonctionne sur n'importe quelle machine de bureau.</p>
+
+  <h3>Étape 1 — Placer les fichiers</h3>
+  <p>Mets dans le <strong>même dossier</strong> :</p>
+  <ul style="margin:12px 0 20px 24px;line-height:2;">
+    <li><code class="i">bo_chemistry.py</code></li>
+    <li><code class="i">config_test.yaml</code> (ou le nom de ta campagne)</li>
+  </ul>
+
+  <h3>Étape 2 — Premier lancement : création du CSV</h3>
+<pre><span class="lang">bash</span><code>python bo_chemistry.py config_test.yaml
+<span class="cm"># ou simplement (détection automatique si un seul .yaml dans le dossier) :</span>
+python bo_chemistry.py</code></pre>
+
+  <p>Le CSV <code class="i">campagne_test.csv</code> est créé et <strong>s'ouvre automatiquement</strong> dans Excel / LibreOffice.</p>
+
+  <h3>Étape 3 — Remplir les données initiales</h3>
+
+  <div class="note intuition">
+    <div class="note-icon">✏️</div>
+    <div class="note-body">
+      <div class="note-label">// Ce qu'il faut remplir</div>
+      <p>1 ligne = 1 expérience. Pour chaque ligne :<br>
+      • Remplir les colonnes de <strong style="color:var(--teal)">paramètres</strong> (température, temps, ligand…)<br>
+      • Remplir les colonnes de <strong style="color:var(--amber)">sorties</strong> (rendement, ee…)<br>
+      • Dans la colonne <code class="i">statut</code> : écrire <strong>fait</strong> (exactement, sans accent)<br>
+      • Laisser <code class="i">iteration_BO</code> et <code class="i">prediction_BO</code> <strong>vides</strong><br>
+      • Minimum recommandé : <strong>2 × (nombre de paramètres)</strong></p>
+    </div>
+  </div>
+
+  <h3>Étape 4 — Lancer l'optimisation</h3>
+<pre><span class="lang">bash</span><code>python bo_chemistry.py config_test.yaml</code></pre>
+
+  <p>Le terminal affiche :</p>
+<pre><span class="lang">Terminal</span><code>==============================================================
+  BO Chimie  |  Campagne : campagne_test
+  Config     |  config_test.yaml
+  Données    |  campagne_test.csv
+==============================================================
+
+  Expériences complètes : 6
+  Meilleur Rendement (%) : 72.00  (Temperature=65  Temps=75  Equiv=2.5)
+
+  Mode         : weighted_sum
+  Acquisition  : EI
+  Suggestions  : 2
+
+  Calcul en cours... (quelques secondes)
+
+  -- Suggestions (itération BO #1) --
+  Suggestion 1/2 :
+    Temperature (C)            : 25.0000
+    Temps de reaction (min)    : 120.0000
+    Equivalents acyl chloride  : 3.0000
+
+  [GRAPHIQUE] Convergence  : campagne_test_iter_01_convergence.png
+  [GRAPHIQUE] Paysage GP   : campagne_test_iter_01_landscape.png
+
+  Rounds sans amélioration : 0/5
+</code></pre>
+
+  <p>Les nouvelles conditions sont ajoutées dans le CSV avec <code class="i">statut = suggere</code>. Les graphiques sont sauvegardés — jamais écrasés.</p>
+
+  <h3>Étape 5 — Aller au labo et enregistrer</h3>
+  <p>Ouvre le CSV. Pour chaque ligne <code class="i">suggere</code> :</p>
+  <ol style="margin:12px 0 20px 24px;line-height:2.2;">
+    <li>Réalise l'expérience aux conditions indiquées</li>
+    <li>Saisis la valeur mesurée dans la colonne de sortie</li>
+    <li>Change <code class="i">statut</code> de <strong style="color:var(--amber)">suggere</strong> → <strong style="color:var(--teal)">fait</strong></li>
+    <li>Sauvegarde le CSV</li>
+  </ol>
+
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// Bloquant : suggestions en attente</div>
+      <p>Si des lignes <code class="i">suggere</code> n'ont pas encore de résultats, le script <strong>ne proposera pas de nouvelles suggestions</strong> — il te rappellera ce qui est en attente. C'est voulu : l'algorithme ne peut pas apprendre sans les mesures.</p>
+    </div>
+  </div>
+
+  <h3>Étape 6 — Répéter jusqu'à convergence</h3>
+<pre><span class="lang">bash</span><code><span class="cm"># Relancer après chaque série de mesures</span>
+python bo_chemistry.py config_test.yaml</code></pre>
+  <p>La convergence est détectée automatiquement (voir Chapitre 09). Quand elle est atteinte, les graphiques finaux haute résolution sont générés.</p>
+</section>
+
+<!-- ══ CH 7 : GRAPHIQUES -->
+<section class="chapter" id="ch7">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 07</div>
+    <h2>Lire ses graphiques</h2>
+  </div>
+
+  <p>À chaque round, deux images sont générées — non-écrasantes (iter_01, iter_02…). En voici le mode d'emploi.</p>
+
+  <h3>Graphique de convergence — <code style="font-size:1rem;">*_convergence.png</code></h3>
+  <p>Style Figure 2b de référence (Gallego, Lavayssière et al., RSC Mechanochem. 2026).</p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Élément</th><th>Couleur</th><th>Ce qu'il montre</th></tr></thead>
+    <tbody>
+      <tr><td>Ligne bleue continue</td><td><span class="tag-blue">bleu</span></td><td><strong>Meilleur score cumulé (running max).</strong> Toujours croissante. Plateau → convergence.</td></tr>
+      <tr><td>Ronds gris remplis</td><td><span style="background:#ddd;padding:2px 8px;border-radius:3px;font-size:11px;">gris</span></td><td>Valeurs <strong>mesurées</strong> de tes expériences initiales.</td></tr>
+      <tr><td>Ronds bordeaux remplis</td><td><span class="tag-amber" style="background:#f5e0db;border-color:#8b3a2a;color:#8b3a2a;">bordeaux</span></td><td>Valeurs <strong>mesurées</strong> des suggestions BO.</td></tr>
+      <tr><td>Cercles ouverts or</td><td><span class="tag-amber">or</span></td><td><strong>Potentiel GP</strong> : ce que le modèle prédisait au moment de la suggestion (stocké dans <code class="i">prediction_BO</code>).</td></tr>
+      <tr><td>Étoile foncée</td><td><span style="background:#f0e0f0;padding:2px 8px;border-radius:3px;font-size:11px;color:#5C0033;">violet</span></td><td>Meilleur point absolu de la campagne.</td></tr>
+      <tr><td>Ligne verticale tiretée</td><td><span style="background:#f0f0f0;padding:2px 8px;border-radius:3px;font-size:11px;">noir</span></td><td>Séparation expériences initiales / suggestions BO.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note concept">
+    <div class="note-icon">👁</div>
+    <div class="note-body">
+      <div class="note-label">// Comment lire les cercles ouverts</div>
+      <p>Si les cercles or <strong>sont au-dessus</strong> des ronds pleins : le GP était trop optimiste (il surestimait). Si les cercles sont <strong>proches</strong> des ronds pleins : le GP est bien calibré — ses prédictions sont fiables. C'est un bon signe de maturité du modèle.</p>
+    </div>
+  </div>
+
+  <h3>Graphique de paysage GP — <code style="font-size:1rem;">*_landscape.png</code></h3>
+  <p>Style Figure 2c de référence. Deux panneaux côte à côte :</p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Panneau</th><th>Ce qu'il montre</th><th>Comment le lire</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Gauche — Contour 2D</strong></td><td>Prédiction μ du GP selon les 2 paramètres les plus influents (ARD shortest lengthscales). Les autres sont fixés à leur valeur optimale connue.</td><td>Jaune = haute prédiction. Points = expériences réelles. Étoile or = meilleur point.</td></tr>
+      <tr><td><strong>Droite — Surface 3D</strong></td><td>Même information en relief. Révèle la forme du paysage.</td><td>Pic unique = optimum sensible. Plateau large = marge de manœuvre. Plusieurs collines = explorer encore.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note concept">
+    <div class="note-icon">🔍</div>
+    <div class="note-body">
+      <div class="note-label">// Pourquoi ces 2 paramètres ?</div>
+      <p>Le script choisit automatiquement les 2 paramètres continus dont les <strong>ARD lengthscales sont les plus courts</strong> — ce sont ceux pour lesquels le rendement varie le plus rapidement. Si ton ligand n'apparaît pas sur la carte, c'est que le GP lui attribue peu d'influence dans ta plage testée. C'est en soi une information chimique utile.</p>
+    </div>
+  </div>
+
+  <h3>Graphiques finaux — <code style="font-size:1rem;">*_FINAL_*.png</code></h3>
+  <p>Générés automatiquement à la convergence (ou <code class="i">convergence_patience</code> rounds sans amélioration). Identiques aux graphiques par round mais en haute résolution (dpi=200). <strong>Directement utilisables pour un rapport ou une publication.</strong></p>
+</section>
+
+<!-- ══ CH 8 : MULTI-OBJECTIF -->
+<section class="chapter" id="ch8">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 08</div>
+    <h2>Multi-objectif : rendement, ee, sélectivité</h2>
+  </div>
+
+  <p>En chimie asymétrique, on optimise rarement un seul chiffre. Trois stratégies sont disponibles via <code class="i">multi_objective_mode</code>.</p>
+
+  <h3>Le front de Pareto — l'idée clé</h3>
+
+  <div class="pareto-wrap">
+    <div class="pareto-title">// Front de Pareto — Rendement vs %ee</div>
+    <svg viewBox="0 0 500 300" style="width:100%; font-family:'Source Serif 4',serif;">
+      <defs><marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#8a7a60"/></marker></defs>
+      <line x1="50" y1="260" x2="470" y2="260" stroke="#d4c8b0" stroke-width="1.5" marker-end="url(#ah)"/>
+      <line x1="50" y1="260" x2="50"  y2="20"  stroke="#d4c8b0" stroke-width="1.5" marker-end="url(#ah)"/>
+      <text x="470" y="278" fill="#8a7a60" font-size="12" text-anchor="end">Rendement (%)</text>
+      <text x="32" y="18"  fill="#8a7a60" font-size="12" text-anchor="middle">ee (%)</text>
+      <circle cx="120" cy="220" r="5" fill="#d4c8b0"/><circle cx="160" cy="200" r="5" fill="#d4c8b0"/>
+      <circle cx="250" cy="170" r="5" fill="#d4c8b0"/><circle cx="280" cy="155" r="5" fill="#d4c8b0"/>
+      <path d="M110,60 C160,65 230,90 300,130 C360,165 410,200 440,230" fill="none" stroke="#2a6b5e" stroke-width="2" stroke-dasharray="6,3"/>
+      <circle cx="110" cy="60"  r="7" fill="#2a6b5e" stroke="white" stroke-width="2"/>
+      <circle cx="185" cy="80"  r="7" fill="#2a6b5e" stroke="white" stroke-width="2"/>
+      <circle cx="270" cy="115" r="7" fill="#2a6b5e" stroke="white" stroke-width="2"/>
+      <circle cx="355" cy="155" r="7" fill="#2a6b5e" stroke="white" stroke-width="2"/>
+      <circle cx="430" cy="210" r="7" fill="#2a6b5e" stroke="white" stroke-width="2"/>
+      <text x="95"  y="52"  fill="#2a6b5e" font-size="11">ee=97%, rdt=25%</text>
+      <text x="440" y="205" fill="#2a6b5e" font-size="11">ee=35%, rdt=85%</text>
+      <text x="235" y="108" fill="#2a6b5e" font-size="11">ee=75%, rdt=58%</text>
+      <circle cx="80" cy="290" r="5" fill="#2a6b5e"/><text x="92" y="294" fill="#3d3020" font-size="11">Front de Pareto</text>
+      <circle cx="200" cy="290" r="5" fill="#d4c8b0"/><text x="212" y="294" fill="#3d3020" font-size="11">Solutions dominées</text>
+    </svg>
+  </div>
+
+  <hr class="rule">
+
+  <h3>Mode 1 — <code class="i">weighted_sum</code></h3>
+  <p>Score = w₁×sortie₁ + w₂×sortie₂. Simple, intuitif. Les poids sont normalisés automatiquement.</p>
+<pre><span class="lang">YAML</span><code>multi_objective_mode: <span class="str">"weighted_sum"</span>
+outputs:
+  - name: <span class="str">"Rendement (%)"</span>
+    direction: maximize
+    weight: <span class="num">0.6</span>    <span class="cm"># 60% de l'importance</span>
+  - name: <span class="str">"ee (%)"</span>
+    direction: maximize
+    weight: <span class="num">0.4</span>    <span class="cm"># 40% de l'importance</span>
+</code></pre>
+  <div class="note warning"><div class="note-icon">⚠️</div><div class="note-body"><div class="note-label">// Limite</div><p>Ne peut pas explorer les zones concaves du front de Pareto. Si rendement et ee sont fortement anticorrélés, certaines solutions optimales restent invisibles.</p></div></div>
+
+  <h3>Mode 2 — <code class="i">pareto</code> (ParEGO)</h3>
+  <p>Tire un vecteur de poids aléatoire à chaque round (distribution de Dirichlet). Explore progressivement tout le front de Pareto sans a priori.</p>
+<pre><span class="lang">YAML</span><code>multi_objective_mode: <span class="str">"pareto"</span>
+<span class="cm"># Les poids déclarés dans outputs sont ignorés en mode pareto
+# Utilise une scalarisation de Chebyshev augmentée (ParEGO)</span>
+</code></pre>
+  <div class="note concept"><div class="note-icon">🗺️</div><div class="note-body"><div class="note-label">// Quand l'utiliser</div><p>Quand tu veux <strong>cartographier le front avant de choisir</strong>. Après 15–20 rounds, tu verras clairement les compromis disponibles, puis tu peux switcher vers <code class="i">weighted_sum</code> ou <code class="i">threshold</code>.</p></div></div>
+
+  <h3>Mode 3 — <code class="i">threshold</code></h3>
+  <p>Certains objectifs doivent satisfaire un seuil <em>avant</em> que le reste soit optimisé.</p>
+<pre><span class="lang">YAML</span><code>multi_objective_mode: <span class="str">"threshold"</span>
+outputs:
+  - name: <span class="str">"Rendement (%)"</span>
+    direction: maximize
+    weight: <span class="num">1.0</span>          <span class="cm"># objectif principal : maximiser</span>
+  - name: <span class="str">"ee (%)"</span>
+    direction: maximize
+    weight: <span class="num">0.0</span>
+    threshold: <span class="num">90</span>         <span class="cm"># contrainte : ee doit être ≥ 90 % d'abord</span>
+</code></pre>
+
+  <h3>Mode 4 — <code class="i">ehvi</code> <span class="pill pill-green">Nouveau v2.3</span></h3>
+  <p>MC-Expected Hypervolume Improvement. Maximise directement le volume dominé sur le front de Pareto — <strong>théoriquement supérieur à ParEGO</strong>, surtout avec 3+ objectifs. Implémenté en numpy pur (aucune dépendance supplémentaire).</p>
+<pre><span class="lang">YAML</span><code>multi_objective_mode: <span class="str">"ehvi"</span>
+bo_settings:
+  ehvi_n_mc: <span class="num">64</span>           <span class="cm"># échantillons MC (32=rapide, 128=rigoureux)</span>
+  n_suggestions: <span class="num">1</span>        <span class="cm"># recommandé : 1 pour limiter le temps de calcul</span>
+  <span class="cm"># ref_point:             # auto-calculé si absent</span>
+  <span class="cm">#   - 0.0                #   une valeur par objectif</span>
+</code></pre>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Critère</th><th>weighted_sum</th><th>pareto (ParEGO)</th><th>threshold</th><th>ehvi</th></tr></thead>
+    <tbody>
+      <tr><td>Complexité config</td><td>Simple</td><td>Simple</td><td>Moyenne</td><td>Simple</td></tr>
+      <tr><td>Explore front concave</td><td>Non</td><td>Oui</td><td>Non</td><td>Oui</td></tr>
+      <tr><td>Qualité théorique</td><td>Basique</td><td>Bonne</td><td>Bonne</td><td><strong>Meilleure</strong></td></tr>
+      <tr><td>Durée/suggestion</td><td>~5s</td><td>~5s</td><td>~5s</td><td>5–90s</td></tr>
+      <tr><td>Recommandé pour</td><td>Débuter, 1 seul sens</td><td>Cartographier le front</td><td>Contrainte dure</td><td>3+ objectifs, précision max</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note intuition"><div class="note-icon">🏆</div><div class="note-body"><div class="note-label">// Workflow recommandé multi-objectif</div><p>1. 10 expériences initiales bien réparties.<br>2. Mode <code class="i">pareto</code> ou <code class="i">ehvi</code> pour 10–15 rounds → cartographier le front.<br>3. Analyser les compromis. Choisir ta priorité.<br>4. Switcher vers <code class="i">weighted_sum</code> ou <code class="i">threshold</code> pour les derniers rounds d'affinage.</p></div></div>
+</section>
+
+<!-- ══ CH 9 : CONVERGENCE + BENCHMARK -->
+<section class="chapter" id="ch9">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 09</div>
+    <h2>Convergence automatique &amp; benchmark</h2>
+  </div>
+
+  <h3>Détection automatique de convergence</h3>
+  <p>Après chaque round, le script vérifie si le meilleur score a progressé de plus de 0.1 % au cours des <code class="i">convergence_patience</code> derniers rounds BO.</p>
+
+  <div class="formula-box">
+    <div class="formula-eq">converge si : (best_now − best_N_rounds_ago) / plage &lt; 0.001</div>
+    <div class="formula-legend">
+      N = <span>convergence_patience</span> (défaut : 5)<br>
+      plage = max(scores) − min(scores) observés<br><br>
+      <strong>Valeur de 5 :</strong> recommandée par Shields et al. (JACS 2021) et Griffiths &amp; Hernández-Lobato (2020) pour les campagnes de chimie à petit budget (&lt;50 expériences). Augmenter à 8–10 pour des campagnes plus longues.
+    </div>
+  </div>
+
+  <p>À la convergence, le terminal affiche :</p>
+<pre><span class="lang">Terminal</span><code>  [CONVERGENCE] Aucune amélioration depuis 5 rounds BO.
+  [GRAPHIQUE] FINAL convergence : campagne_test_FINAL_convergence.png
+  [GRAPHIQUE] FINAL paysage   : campagne_test_FINAL_landscape.png
+
+  -> La campagne semble avoir convergé.
+     Si vous souhaitez continuer, augmentez 'convergence_patience'</code></pre>
+
+  <div class="note concept"><div class="note-icon">🔁</div><div class="note-body"><div class="note-label">// Continuer malgré la convergence</div><p>Dans le YAML, augmente <code class="i">convergence_patience: 8</code> ou change de fonction d'acquisition (UCB avec kappa=3) pour forcer l'exploration. La convergence est un signal, pas un verrou — c'est toi qui décides quand t'arrêter.</p></div></div>
+
+  <h3>Benchmark des fonctions d'acquisition</h3>
+  <p>Compare EI, UCB, PI, Thompson et Random sur tes données existantes — sans retourner au labo.</p>
+
+<pre><span class="lang">bash</span><code>python bo_chemistry.py --benchmark
+<span class="cm"># ou explicitement :</span>
+python bo_chemistry.py config_test.yaml --benchmark</code></pre>
+
+  <div class="note intuition"><div class="note-icon">⚙️</div><div class="note-body"><div class="note-label">// Comment fonctionne le benchmark</div><p>1. Un <strong>GP oracle</strong> est entraîné sur toutes tes données disponibles — il sert de simulateur de laboratoire.<br>2. Pour chaque fonction d'acquisition et chaque répétition : on repart des données initiales, on simule N itérations BO en interrogeant l'oracle.<br>3. Résultat : courbes <strong>meilleur score moyen ± écart-type</strong> par fonction, comme la Figure 3 des publications de référence.</p></div></div>
+
+  <p>Configuration dans le YAML :</p>
+<pre><span class="lang">YAML</span><code>bo_settings:
+  benchmark_n_iter: <span class="num">10</span>   <span class="cm"># itérations simulées (plus = plus informatif, plus lent)</span>
+  benchmark_n_rep: <span class="num">5</span>    <span class="cm"># répétitions pour la courbe moyenne</span>
+</code></pre>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Lecture du graphique</th><th>Interprétation</th></tr></thead>
+    <tbody>
+      <tr><td>Courbe monte vite et haut</td><td>Fonction efficace sur ton espace chimique</td></tr>
+      <tr><td>Courbe "Random"</td><td>Niveau de référence — toute vraie fonction doit faire mieux</td></tr>
+      <tr><td>Bandes d'incertitude larges</td><td>Comportement variable selon les points initiaux</td></tr>
+      <tr><td>Tirets "Optimum oracle"</td><td>Plafond théorique — pas un objectif à atteindre en pratique</td></tr>
+    </tbody>
+  </table></div>
+
+  <hr class="rule">
+
+  <h3>Checklist avant de lancer</h3>
+  <ul class="checklist">
+    <li>Mon CSV a au moins 2 × (nombre de paramètres) lignes avec <code class="i">statut = fait</code></li>
+    <li>Les noms de colonnes dans le CSV correspondent exactement au YAML (casse, espaces)</li>
+    <li>Les variables catégorielles ont leurs catégories toutes déclarées dans le YAML</li>
+    <li>Les bornes min/max sont chimiquement réalistes (T° &lt; bp solvant, etc.)</li>
+    <li>J'ai choisi le bon mode multi-objectif selon mes priorités (voir tableau Ch. 08)</li>
+    <li>Je connais mon budget : combien de rounds et combien d'expériences par batch</li>
+    <li>Si régiosélectivité : j'utilise le log₁₀(ratio) dans le CSV, pas le ratio brut</li>
+  </ul>
+
+  <div class="note concept">
+    <div class="note-icon">📚</div>
+    <div class="note-body">
+      <div class="note-label">// Références</div>
+      <p><strong>Gallego, Lavayssière et al. — RSC Mechanochem. 2026</strong> : réaction d'acylation en ball-mill, les figures 2b et 2c du guide.<br><br>
+      <strong>Shields et al. — JACS 2021</strong> : BO pour des réactions palladées, référence sur la patience de convergence.<br><br>
+      <strong>Griffiths &amp; Hernández-Lobato — NeurIPS 2020</strong> : fondement théorique ParEGO vs EHVI en chimie.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══ CH 10 : NOUVELLES FEATURES v2.4 -->
+<section class="chapter" id="ch10">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 10</div>
+    <h2>Nouvelles features — v2.4</h2>
+  </div>
+
+  <h3>Mode <code class="i">--status</code> — lecture seule</h3>
+  <p>Lance une lecture seule de la campagne sans générer de nouvelles suggestions ni modifier aucun fichier. Utile pour un check rapide en réunion ou avant de décider de continuer.</p>
+<pre><span class="lang">bash</span><code>python bo_chemistry.py config_test.yaml --status</code></pre>
+  <p>Affiche : nombre d'expériences complètes, meilleur résultat par objectif, rounds effectués, état de la convergence. Rien n'est écrit sur le disque.</p>
+
+  <h3>Rapport texte automatique — <code class="i">*_iter_XX_report.txt</code></h3>
+  <p>Après chaque round BO, un fichier texte résumé est généré automatiquement. Contenu : statistiques actuelles, conditions suggérées avec prédiction GP, progression de la convergence, étapes suivantes. Idéal pour le cahier de labo électronique ou les compte-rendus hebdomadaires.</p>
+
+  <div class="note concept">
+    <div class="note-icon">📄</div>
+    <div class="note-body">
+      <div class="note-label">// Format du rapport</div>
+      <p>Le rapport est un fichier texte lisible sans aucun logiciel spécifique. Il est non-écrasant (incrémente automatiquement) et peut être directement copié dans un email ou un wiki interne de projet.</p>
+    </div>
+  </div>
+
+  <h3>Analyse GP — Comprendre les suggestions <span class="pill pill-teal">Nouveau</span></h3>
+  <p>Après chaque calcul de suggestion, le script affiche automatiquement une analyse du modèle GP :</p>
+
+  <div class="note intuition">
+    <div class="note-icon">🔍</div>
+    <div class="note-body">
+      <div class="note-label">// Ce qui s'affiche dans le terminal</div>
+      <p><strong>Importance des paramètres</strong> (ARD length-scales) : une barre de progression indique l'influence de chaque variable continue. Un length-scale court → le rendement varie vite avec ce paramètre → <strong>paramètre critique</strong>. Un length-scale long → peu d'influence sur la plage testée.<br><br>
+      <strong>Motif de chaque suggestion</strong> : exploration (σ élevé, zone peu connue) ou exploitation (μ élevé, zone prometteuse). Avec les valeurs numériques μ et σ au point suggéré.<br><br>
+      Ce n'est pas de la magie noire — c'est ce que le GP a appris de tes données.</p>
+    </div>
+  </div>
+
+<pre><span class="lang">Terminal</span><code>  ──────────────────────────────────────────────────────────────
+  ANALYSE DU MODELE GP
+  ──────────────────────────────────────────────────────────────
+
+  Importance des parametres (ARD length-scales) :
+    Temperature (C)              ███████████████████████████  98.8%  FORT   ***
+    Temps de reaction (min)      █                             1.2%  FAIBLE   *
+
+  -> Parametre le plus influent : Temperature (C)
+
+  Pourquoi ces conditions ?
+
+  Suggestion 1/2 :
+    Prediction GP (mu)    : 82.3150
+    Incertitude  (sigma)  : 8.4220  (ratio=0.10)
+    Motif dominant        : exploration   (zone peu connue, sigma eleve)
+  ──────────────────────────────────────────────────────────────</code></pre>
+
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// Interpréter avec prudence</div>
+      <p>L'importance des paramètres reflète les données que tu as fournies. Avec seulement 6–10 points initiaux, le GP peut se tromper sur l'importance relative. L'information devient fiable à partir de ~15 expériences. Si un paramètre que tu sais être critique apparaît comme "faible", c'est souvent parce que tu n'as pas encore exploré suffisamment sa plage.</p>
+    </div>
+  </div>
+
+  <h3>Options graphiques — micro-configuration</h3>
+  <p>Trois nouvelles clés dans <code class="i">bo_settings</code> du YAML :</p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Clé YAML</th><th>Valeur par défaut</th><th>Usage</th></tr></thead>
+    <tbody>
+      <tr><td><code class="i">colorblind_mode</code></td><td><code class="i">false</code></td><td>Palette Wong 2011 dalton-friendly. Recommandé pour publications et présentations à large audience.</td></tr>
+      <tr><td><code class="i">fig_dpi</code></td><td><code class="i">150</code></td><td>Résolution PNG. 150 = travail. 200 = publication/poster. 100 = revue rapide.</td></tr>
+      <tr><td><code class="i">fig_width</code></td><td><code class="i">14</code></td><td>Largeur des figures en pouces. 14 = écran large. 10 = slides compact.</td></tr>
+      <tr><td><code class="i">timestamp_outputs</code></td><td><code class="i">false</code></td><td>Préfixe <code class="i">YYYYMMDD_HHMMSS_</code> sur les noms de fichiers. Utile pour garder tous les graphiques quand on relance plusieurs fois par jour.</td></tr>
+    </tbody>
+  </table></div>
+
+<pre><span class="lang">YAML</span><code>bo_settings:
+  <span class="cm"># ... vos réglages habituels ...</span>
+  colorblind_mode: <span class="kw">true</span>    <span class="cm"># palette daltonien</span>
+  fig_dpi: <span class="num">200</span>              <span class="cm"># haute résolution</span>
+  fig_width: <span class="num">12</span>             <span class="cm"># compact pour slides</span>
+  timestamp_outputs: <span class="kw">true</span>   <span class="cm"># horodatage des fichiers</span>
+</code></pre>
+</section>
+
+
+<!-- ══ CH 11 : STAGNATION -->
+<section class="chapter" id="ch11">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 11</div>
+    <h2>Détection automatique<br>de stagnation — v2.5</h2>
+  </div>
+
+  <p>
+    Nouveau en v2.5 : le script détecte automatiquement quand une variable continue reste
+    coincée sur la même valeur pendant plusieurs rounds, et bascule sur Thompson (n=3) pour
+    sortir du plateau — sans intervention manuelle.
+  </p>
+
+  <div class="note intuition">
+    <div class="note-icon">🔍</div>
+    <div class="note-body">
+      <div class="note-label">// Le problème concret</div>
+      <p>Imagine que le seul bon point de ta campagne est à <code class="i">t=80 min</code>.
+      Toutes les suggestions suivantes atterrissent autour de <code class="i">t≈79-82 min</code>.
+      Le GP est convaincu que c'est l'optimum — mais il n'a jamais vu de bon résultat à
+      <code class="i">t=95 min</code> avec les bonnes autres conditions. Il ne peut pas inventer
+      cette information. La stagnation est détectée, Thompson prend le relai.</p>
+    </div>
+  </div>
+
+  <h3>Ce que tu vois dans le terminal</h3>
+
+<pre><span class="lang">Terminal</span><code>  ==============================================================
+  [STAGNATION DETECTEE] sur 1 parametre(s)
+  3 derniers rounds  |  seuil std = 5.0%
+  --------------------------------------------------------------
+    Temps (min)              <span class="kw">std=0.014</span>  moy=80.75
+  --------------------------------------------------------------
+  Action automatique :
+    Acquisition -> <span class="fn">Thompson</span>  (diversite naturelle par batch)
+    n_suggestions -> <span class="num">3</span>        (au moins 1 sortira du plateau)
+  Pour desactiver : stagnation_detection: false dans le YAML
+  ==============================================================</code></pre>
+
+  <div class="note concept">
+    <div class="note-icon">⚙️</div>
+    <div class="note-body">
+      <div class="note-label">// Pourquoi Thompson + 3 suggestions</div>
+      <p>Thompson tire des scénarios <strong>indépendants</strong> du posterior GP.
+      Avec 3 suggestions, la probabilité qu'au moins une sorte du plateau est statistiquement
+      bien plus haute qu'avec une seule. Le script revient automatiquement à tes réglages
+      d'origine dès que la stagnation disparaît. Tu ne changes rien au YAML.</p>
+    </div>
+  </div>
+
+  <h3>Configuration dans le YAML</h3>
+
+<pre><span class="lang">YAML</span><code>bo_settings:
+  <span class="cm">  # ── Stagnation (nouveau v2.5) ──────────────────────</span>
+  stagnation_detection: <span class="kw">true</span>       <span class="cm"># activer (recommande)</span>
+  stagnation_patience: <span class="num">3</span>          <span class="cm"># rounds avant detection</span>
+  stagnation_std_threshold: <span class="num">0.05</span>  <span class="cm"># seuil ecart-type normalise</span>
+</code></pre>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Paramètre</th><th>Valeur défaut</th><th>Ajuster si...</th></tr></thead>
+    <tbody>
+      <tr><td><code class="i">stagnation_patience</code></td><td><code class="i">3</code></td><td>Trop de faux positifs → augmenter à 5. Trop lent à réagir → réduire à 2.</td></tr>
+      <tr><td><code class="i">stagnation_std_threshold</code></td><td><code class="i">0.05</code></td><td>Trop sensible → augmenter à 0.08. Pas assez → réduire à 0.03.</td></tr>
+      <tr><td><code class="i">stagnation_detection</code></td><td><code class="i">true</code></td><td>Mettre à <code class="i">false</code> si la variable a genuinement convergé et que tu ne veux pas le override.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// Stagnation ≠ convergence</div>
+      <p>La stagnation d'une <strong>variable</strong> ne signifie pas que la campagne a convergé.
+      Elle signifie que le GP n'explore plus cette dimension. La <strong>convergence du score</strong>
+      reste gérée séparément par <code class="i">convergence_patience</code>. Les deux mécanismes
+      sont indépendants et complémentaires.</p>
+    </div>
+  </div>
+
+  <h3>Ce qu'il faut retenir sur les points initiaux</h3>
+  <p>
+    La stagnation survient presque toujours parce que les <strong>points initiaux ne couvrent
+    pas uniformément chaque dimension</strong>. Si tous tes bons points initiaux sont à
+    <code class="i">t=80 min</code>, le GP ancrera ses suggestions à <code class="i">t≈80 min</code>
+    indépendamment de la qualité de l'acquisition. La meilleure prévention : utiliser un
+    <strong>Latin Hypercube Sampling</strong> pour les points initiaux, ou t'assurer que chaque
+    variable couvre au moins 3 niveaux distincts répartis sur sa plage.
+  </p>
+
+  <div class="note concept">
+    <div class="note-icon">📐</div>
+    <div class="note-body">
+      <div class="note-label">// Règle pratique</div>
+      <p>Pour 3 variables avec une plage chacune : place au moins 1 point dans chaque tiers
+      de chaque variable, indépendamment. 3 tiers × 3 variables = plan de 9 points initiaux
+      bien répartis. C'est plus important que n'importe quel réglage d'acquisition.</p>
+    </div>
+  </div>
+</section>
+
+
+<!-- ══ CH 12 : DERIVE + LHS -->
+<section class="chapter" id="ch12">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 12</div>
+    <h2>Dérive directionnelle<br>&amp; LHS — v2.6</h2>
+  </div>
+
+  <h3>Le problème que la stagnation ne résout pas</h3>
+  <p>
+    La stagnation (v2.5) détecte quand une variable reste <strong>immobile</strong>.
+    Mais il existe un autre piège tout aussi fréquent : la variable <strong>dérive</strong>
+    dans une direction sans que le score ne progresse — le GP dépasse l'optimum et continue
+    dans le même sens, faute de données de l'autre côté.
+  </p>
+
+  <div class="note intuition">
+    <div class="note-icon">📈</div>
+    <div class="note-body">
+      <div class="note-label">// Exemple reel observe</div>
+      <p>Le GP a vu <code class="i">t=124 min → 61%</code>. Il suggère <code class="i">t=128</code>
+      puis <code class="i">t=134</code> — toujours plus long — sans jamais revenir vers
+      <code class="i">t=110 min</code> (le vrai optimum). Le score stagne autour de 60-61%.
+      La dérive est détectée et le script bascule sur UCB kappa=0.2 pour ramener
+      les suggestions vers le maximum de μ(x), pas vers les zones d'incertitude.</p>
+    </div>
+  </div>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Mécanisme</th><th>Détecte quand</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Stagnation</strong> v2.5</td><td>Variable <em>immobile</em> — std faible</td><td>Thompson + n=3</td></tr>
+      <tr><td><strong>Dérive</strong> v2.6</td><td>Variable <em>dérive</em> + score stagne</td><td>UCB kappa=0.2, n=1</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note warning">
+    <div class="note-icon">🔒</div>
+    <div class="note-body">
+      <div class="note-label">// Condition de sécurité</div>
+      <p>La dérive ne se déclenche <strong>que si le score ne progresse pas</strong>
+      (amélioration &lt; 0.5%). Si le score continue de monter malgré la dérive, le script
+      laisse le GP continuer — l'optimum est peut-être vraiment dans cette direction.
+      C'est ce qui distingue une vraie dérive d'une progression normale.</p>
+    </div>
+  </div>
+
+  <h3>Configuration YAML</h3>
+<pre><span class="lang">YAML</span><code>bo_settings:
+  drift_detection: <span class="kw">true</span>
+  drift_patience: <span class="num">3</span>          <span class="cm"># rounds avant detection</span>
+  drift_slope_threshold: <span class="num">0.03</span>  <span class="cm"># 3% de la plage par round</span>
+</code></pre>
+
+  <h3>Points initiaux par Latin Hypercube Sampling</h3>
+  <p>
+    La plupart des plateaux et dérives viennent d'un mauvais plan initial.
+    La commande <code class="i">--init-doe</code> génère automatiquement un plan
+    <strong>Latin Hypercube</strong> qui garantit qu'aucune dimension n'est sous-représentée.
+  </p>
+
+  <div class="note concept">
+    <div class="note-icon">📐</div>
+    <div class="note-body">
+      <div class="note-label">// LHS vs coins classiques</div>
+      <p>Avec les 6 points initiaux classiques aux coins [15, 15, 140, 140, 75, 45 min],
+      le GP ancre ses suggestions à <code class="i">t≈74 min</code> pendant 7 itérations.
+      LHS sur 6 points génère <code class="i">t ≈ [23, 55, 70, 95, 108, 124 min]</code>
+      — la zone t=95-110 est couverte dès le départ. Le plateau ne se serait pas formé.</p>
+    </div>
+  </div>
+
+<pre><span class="lang">bash</span><code><span class="cm"># N automatique (2 x nb_params_continus + 1)</span>
+python bo_chemistry.py config.yaml <span class="fn">--init-doe</span>
+
+<span class="cm"># N specifique</span>
+python bo_chemistry.py config.yaml <span class="fn">--init-doe</span> <span class="fn">--doe-n</span> <span class="num">9</span></code></pre>
+
+  <p>Le CSV généré a <code class="i">statut = initial</code>. Réalisez les expériences,
+  remplissez les résultats, changez en <code class="i">fait</code>, puis relancez normalement.</p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Méthode d'initialisation</th><th>Avantage</th><th>Risque</th></tr></thead>
+    <tbody>
+      <tr><td>Coins (OFAT)</td><td>Explore les extrêmes</td><td>Laisse les zones centrales vides</td></tr>
+      <tr><td>Aléatoire</td><td>Simple</td><td>Peut laisser des dimensions sous-couvertes</td></tr>
+      <tr><td><strong>LHS (--init-doe)</strong></td><td>Couverture uniforme garantie</td><td>Aucun — recommandé par défaut</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+
+<!-- ══ CH 13 : ACQUISITION GUIDE + OUTLIERS + LHS CLARIFICATION -->
+<section class="chapter" id="ch13">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 13</div>
+    <h2>Fonctions d'acquisition —<br>Guide de décision pratique</h2>
+  </div>
+
+  <h3>Quand changer de fonction — arbre de décision</h3>
+
+  <div class="note concept">
+    <div class="note-icon">🗺</div>
+    <div class="note-body">
+      <div class="note-label">// La règle centrale</div>
+      <p>Le choix de la fonction n'est pas définitif. Le bon réflexe est de regarder
+      ce que le script fait réellement — et de changer <em>uniquement</em> si le comportement
+      est problématique. La grande majorité des campagnes se termine bien avec EI par défaut.</p>
+    </div>
+  </div>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Situation observée</th><th>Problème</th><th>Solution</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Suggestions toujours aux coins (T=20 ou T=90)</td>
+        <td>GP sur-explore par incertitude haute</td>
+        <td><code class="i">UCB kappa=0.3</code> — exploitation pure</td>
+      </tr>
+      <tr>
+        <td>Suggestions quasi-identiques dans un batch</td>
+        <td>Kriging Believer clustering</td>
+        <td><code class="i">Thompson</code> — diversité naturelle</td>
+      </tr>
+      <tr>
+        <td>Suggestions toujours dans la même zone, score stagne</td>
+        <td>Stagnation → Thompson+3 automatique (v2.5)</td>
+        <td>Laisser faire le script</td>
+      </tr>
+      <tr>
+        <td>Variable dérive sans améliorer le score</td>
+        <td>Overshoot → UCB 0.2 automatique (v2.6)</td>
+        <td>Laisser faire le script</td>
+      </tr>
+      <tr>
+        <td>Budget limité, préfère des gains sûrs</td>
+        <td>EI trop exploratoire en fin de campagne</td>
+        <td><code class="i">PI</code> ou <code class="i">EI xi=0.001</code></td>
+      </tr>
+      <tr>
+        <td>Début de campagne, peu de points</td>
+        <td>EI sous-explore</td>
+        <td><code class="i">UCB kappa=2.5</code> ou <code class="i">EI xi=0.05</code></td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>Comment xi et kappa influencent les suggestions</h3>
+
+  <p>Les deux paramètres clés contrôlent le même arbitrage fondamental :</p>
+
+  <pre><span class="lang">Formules</span><code>EI :   score(x) = E[max(f(x) - f_best, 0)]
+               xi eleve  →  f_best fictif abaisse  →  zone plus large cherchee
+
+UCB :  score(x) = mu(x) + kappa * sigma(x)
+               kappa = 0  →  suit uniquement mu (exploitation pure)
+               kappa ∞    →  suit uniquement sigma (exploration pure)</code></pre>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Paramètre</th><th>Valeur</th><th>Effet concret</th><th>Quand</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="3"><strong>EI xi</strong></td><td><code class="i">0.001</code></td><td>Exploitation pure — reste près du meilleur connu</td><td>Fin de campagne, affinage</td></tr>
+      <tr><td><code class="i">0.01</code> (défaut)</td><td>Équilibre standard</td><td>Toujours</td></tr>
+      <tr><td><code class="i">0.05–0.20</code></td><td>Explore plus loin — peut rater l'optimum proche</td><td>Si bloqué, à utiliser ponctuellement</td></tr>
+      <tr><td rowspan="4"><strong>UCB kappa</strong></td><td><code class="i">0.2–0.5</code></td><td>Quasi-exploitation : suit μ(x), ignore σ</td><td>Pour débloquer une dérive ou forcer l'exploitation</td></tr>
+      <tr><td><code class="i">1.0</code></td><td>Légèrement exploratoire</td><td>Phase d'affinage</td></tr>
+      <tr><td><code class="i">2.0</code> (défaut)</td><td>Équilibre — bon pour exploration initiale</td><td>Début de campagne</td></tr>
+      <tr><td><code class="i">3.0+</code></td><td>Forte exploration — teste des zones inconnues</td><td>Si toutes les suggestions se ressemblent trop</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note intuition">
+    <div class="note-icon">💡</div>
+    <div class="note-body">
+      <div class="note-label">// Mémo pratique</div>
+      <p><strong>EI xi</strong> : imagine que le "bar à battre" descend proportionnellement à xi.
+      Avec xi élevé, n'importe quel point légèrement meilleur compte — le GP explore plus loin.
+      <br><br>
+      <strong>UCB kappa</strong> : c'est la prime de risque que tu accordes à l'incertitude.
+      kappa=0 = investisseur ultra-conservateur (suit la prédiction).
+      kappa=3 = aventurier (cherche les zones inconnues).</p>
+    </div>
+  </div>
+
+  <h3>Séquence recommandée sur une campagne typique</h3>
+
+<pre><span class="lang">YAML — évolution recommandée au fil de la campagne</span><code><span class="cm"># Phase 1 — Exploration (iters 1-5, peu de données)</span>
+acquisition: <span class="kw">"UCB"</span>
+ucb_kappa: <span class="num">2.5</span>    <span class="cm"># explore activement</span>
+n_suggestions: <span class="num">2</span>
+
+<span class="cm"># Phase 2 — Apprentissage (iters 5-15)</span>
+acquisition: <span class="kw">"EI"</span>
+xi: <span class="num">0.01</span>           <span class="cm"># defaut — bon equilibre</span>
+n_suggestions: <span class="num">2</span>
+<span class="cm"># La stagnation et la derive sont gérées automatiquement</span>
+
+<span class="cm"># Phase 3 — Affinage (iters 15+, score > 80%)</span>
+acquisition: <span class="kw">"EI"</span>
+xi: <span class="num">0.001</span>         <span class="cm"># exploitation — reste près du meilleur</span>
+n_suggestions: <span class="num">1</span>  <span class="cm"># une seule suggestion pour la précision</span></code></pre>
+
+  <h3>LHS vs plans factoriels — clarification</h3>
+
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// LHS ≠ Plan factoriel complet</div>
+      <p>Un plan factoriel complet 2^k teste chaque variable à 2 niveaux (haut/bas) :
+      pour 3 variables → <strong>2³ = 8 expériences aux 8 coins</strong>.
+      Il n'explore pas le centre ni les zones intermédiaires — et les coins sont
+      souvent les zones les moins intéressantes chimiquement.<br><br>
+      Le <strong>LHS avec N points</strong> garantit qu'aucune dimension n'est sous-représentée,
+      en couvrant toute la plage uniformément. Pour 3 variables et N=6 :
+      6 expériences réparties sur toute la plage, pas seulement les coins.</p>
+    </div>
+  </div>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Design</th><th>3 variables, N=6</th><th>Couverture</th><th>Idéal pour</th></tr></thead>
+    <tbody>
+      <tr><td>Factoriel 2³</td><td>8 expériences</td><td>Coins uniquement</td><td>Screening — effets principaux et interactions</td></tr>
+      <tr><td>Box-Behnken</td><td>13 expériences</td><td>Milieux des arêtes + centre</td><td>Modèle quadratique — surface de réponse</td></tr>
+      <tr><td>CCD (central composite)</td><td>15+ expériences</td><td>Coins + centre + étoile</td><td>Optimisation précise mais coûteuse</td></tr>
+      <tr><td><strong>LHS (--init-doe)</strong></td><td>N au choix</td><td>Uniforme sur toute la plage</td><td>Points initiaux pour BO — recommandé</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>En pratique pour la BO : le LHS avec <strong>N = 2 × (nombre de paramètres) + 1</strong>
+  est le meilleur point de départ. Pour 3 variables → 7 expériences initiales bien réparties.
+  Cela coûte 1 expérience de plus qu'un factoriel 2³ mais couvre bien mieux l'espace.</p>
+
+  <h3>Autres problèmes algorithmiques et leur traitement</h3>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Problème</th><th>Symptôme</th><th>Traitement (v2.8)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Outlier</strong></td>
+        <td>GP très mal calibré soudainement — prédictions absurdes</td>
+        <td><code class="i">outlier_detection: true</code> → flag les mesures > 3σ du résidu LOO</td>
+      </tr>
+      <tr>
+        <td><strong>Saturation de borne</strong></td>
+        <td>Toutes les suggestions à T=90 (ou T=25) depuis N rounds</td>
+        <td>Avertissement automatique + conseil d'élargir la plage</td>
+      </tr>
+      <tr>
+        <td><strong>Stagnation de variable</strong></td>
+        <td>t reste à ≈74 min sur 4 itérations</td>
+        <td>Thompson + 3 automatique (v2.5)</td>
+      </tr>
+      <tr>
+        <td><strong>Dérive directionnelle</strong></td>
+        <td>t monte de 124 → 128 → 134 min sans progresser</td>
+        <td>UCB kappa=0.2 automatique (v2.6)</td>
+      </tr>
+      <tr>
+        <td><strong>Clustering de batch</strong></td>
+        <td>n=2 avec EI donne 2 suggestions quasi-identiques</td>
+        <td>Thompson recommandé pour n≥2 (voir ch.7)</td>
+      </tr>
+      <tr>
+        <td><strong>Optimum hors plage</strong></td>
+        <td>Meilleure mesure toujours au bord — saturation de borne</td>
+        <td>Avertissement automatique → élargir bornes dans YAML</td>
+      </tr>
+      <tr>
+        <td><strong>Bruit hétéroscédastique</strong></td>
+        <td>Mesures très reproductibles dans une zone, très bruitées ailleurs</td>
+        <td>Non implémenté — utiliser le paramètre <code class="i">alpha</code> du GP (voir docs sklearn)</td>
+      </tr>
+      <tr>
+        <td><strong>Multi-modalité vraie</strong></td>
+        <td>Plusieurs optima de même niveau — le GP en rate un</td>
+        <td>Non détectable algorithmiquement sans information chimique</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+</section>
+
+
+<!-- ══ CH 14 : BRUIT, BOX-COX, MULTI-MODALITE -->
+<section class="chapter" id="ch14">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 14</div>
+    <h2>Comment fonctionnent<br>les acquisitions — en détail</h2>
+  </div>
+
+  <h3>La mécanique interne des fonctions d'acquisition</h3>
+  <p>
+    Toutes les fonctions d'acquisition répondent à la même question :
+    <strong>en quel point x de l'espace dois-je faire la prochaine expérience ?</strong>
+    Elles combinent deux informations que le GP fournit pour tout point non encore testé :
+  </p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Symbole</th><th>Nom</th><th>Signification physique</th></tr></thead>
+    <tbody>
+      <tr><td><code class="i">μ(x)</code></td><td>Moyenne GP</td><td>La meilleure estimation du rendement en x — ce que le modèle <em>pense</em> trouver là</td></tr>
+      <tr><td><code class="i">σ(x)</code></td><td>Écart-type GP</td><td>L'incertitude du modèle en x — faible près des données, élevé dans les zones inexplorées</td></tr>
+    </tbody>
+  </table></div>
+
+<pre><span class="lang">Formules complètes</span><code><span class="cm">EI (Expected Improvement) :</span>
+  Z   = (μ(x) - f_best - xi) / σ(x)
+  EI  = σ(x) · [Z · Φ(Z) + φ(Z)]
+  <span class="cm">Φ = CDF normale  φ = PDF normale  xi = paramètre exploration</span>
+  <span class="cm">→ Calcule l'ESPERANCE d'amélioration par rapport au meilleur connu.</span>
+  <span class="cm">→ xi=0 : amélioration minime suffit   xi=0.1 : cherche une forte amélioration</span>
+
+<span class="cm">UCB (Upper Confidence Bound) :</span>
+  UCB = μ(x) + kappa · σ(x)
+  <span class="cm">→ Prime accordée à l'incertitude. kappa=0 = suit μ seul. kappa=3 = suit σ.</span>
+
+<span class="cm">PI (Probability of Improvement) :</span>
+  PI  = Φ((μ(x) - f_best - xi) / σ(x))
+  <span class="cm">→ Probabilité BRUTE de dépasser f_best. Plus conservateur qu'EI (ignore l'amplitude).</span>
+
+<span class="cm">Thompson Sampling :</span>
+  f̃(x) ~ GP(μ, K)   puis   x* = argmax f̃(x)
+  <span class="cm">→ Tire un scénario aléatoire du posterior GP, optimise dessus.</span>
+  <span class="cm">→ Naturellement diversifié pour les batchs — chaque tirage donne un x* différent.</span></code></pre>
+
+  <div class="note intuition">
+    <div class="note-icon">🏔</div>
+    <div class="note-body">
+      <div class="note-label">// Analogie montagne dans le brouillard</div>
+      <p><strong>EI</strong> dit : "je vais là où j'ai le plus de <em>chances d'améliorer</em> — soit parce que c'est haut (μ élevé), soit parce que c'est mystérieux (σ élevé), soit les deux."<br>
+      <strong>UCB</strong> dit : "je vais là où la borne haute de mon intervalle de confiance est maximale — optimiste par nature."<br>
+      <strong>Thompson</strong> dit : "j'imagine un scénario possible du terrain et je vais au sommet de ce scénario — exploration probabiliste."</p>
+    </div>
+  </div>
+
+  <h3>Le bruit expérimental dans le GP — paramètre alpha</h3>
+
+  <p>
+    Tout GP inclut un paramètre de bruit <code class="i">alpha</code> (ou <em>nugget</em>)
+    qui représente la variance du bruit expérimental supposé <strong>uniforme</strong>
+    dans tout l'espace. Cette hypothèse est souvent fausse en chimie.
+  </p>
+
+  <div class="note concept">
+    <div class="note-icon">⚗️</div>
+    <div class="note-body">
+      <div class="note-label">// Bruit homoscédastique vs hétéroscédastique</div>
+      <p><strong>Homoscédastique (supposé par le GP standard) :</strong>
+      même bruit partout — 0.1% d'erreur à 10% de rendement ET à 90%.
+      <br><br>
+      <strong>Hétéroscédastique (réalité chimique) :</strong>
+      bruit faible près de l'optimum (réaction reproductible),
+      bruit fort dans les zones marginales (réaction peu controlée).
+      <br><br>
+      <strong>Conséquence :</strong> le GP sur-lisse les zones bruitées et
+      sous-ajuste les zones propres. Les prédictions sont moins fiables.
+      <strong>Solution partielle : la transformation Box-Cox.</strong></p>
+    </div>
+  </div>
+
+  <h3>Transformation Box-Cox — stabiliser le bruit</h3>
+
+  <p>
+    La transformation Box-Cox est une famille de transformations monotones
+    qui rend la distribution de la sortie plus gaussienne et le bruit plus uniforme.
+  </p>
+
+<pre><span class="lang">Formule Box-Cox</span><code>y_bc = (y^λ - 1) / λ    si λ ≠ 0
+y_bc = log(y)           si λ = 0
+
+<span class="cm">Cas particuliers courants :</span>
+  λ = 0     → transformation logarithmique (pour les données très asymétriques)
+  λ = 0.5   → racine carrée (pour les counts, Poisson-like)
+  λ = 1     → identité (pas de transformation — données déjà gaussiennes)
+  λ estimé  → maximise la vraisemblance — automatique dans le script</code></pre>
+
+  <div class="note concept">
+    <div class="note-icon">📊</div>
+    <div class="note-body">
+      <div class="note-label">// Ce que ça change concrètement</div>
+      <p>Distribution typique des rendements chimiques : asymétrique à droite
+      (beaucoup de valeurs 0-30%, peu de 80-100%). La Box-Cox avec λ≈0.1-0.3
+      compresse les grandes valeurs et étire les petites, rendant la distribution
+      plus symétrique.<br><br>
+      Le GP est entraîné sur les valeurs transformées, puis les prédictions sont
+      reconverties à l'échelle réelle. <strong>Aucun paramètre à régler</strong> —
+      λ est estimé automatiquement.
+      Activer avec <code class="i">boxcox: true</code> dans le YAML.</p>
+    </div>
+  </div>
+
+<pre><span class="lang">YAML</span><code>bo_settings:
+  boxcox: <span class="kw">true</span>     <span class="cm"># activer la transformation Box-Cox</span>
+  <span class="cm"># lambda estimé automatiquement par maximum de vraisemblance</span>
+  <span class="cm"># condition : toutes les valeurs de sortie doivent être > 0</span>
+  <span class="cm"># si des 0 existent → offset automatique appliqué</span></code></pre>
+
+  <h3>Multi-modalité — détecter plusieurs optima</h3>
+
+  <p>
+    Un espace chimique est <strong>multi-modal</strong> quand plusieurs zones
+    donnent des rendements élevés. C'est fréquent : un même substrat peut réagir
+    via deux mécanismes différents selon les conditions, donnant deux "pics" dans
+    le paysage. La BO classique en trouve un et l'exploite — elle peut rater l'autre.
+  </p>
+
+  <div class="note intuition">
+    <div class="note-icon">🏔🏔</div>
+    <div class="note-body">
+      <div class="note-label">// Exemple multi-modal</div>
+      <p>Dans notre test : faux pic local à T=72°C, t=55 min, eq=1.5 (57%)
+      et optimum global à T=47°C, t=110 min, eq=2.8 (100%). Le GP aurait pu
+      se fixer sur le faux pic et ne jamais explorer la zone de l'optimum global.
+      <br><br>
+      La détection multi-modale liste les autres zones prometteuses dans le terminal
+      à chaque round — sans les suggérer automatiquement, car seul le chimiste peut
+      décider si un optimum alternatif a un sens physico-chimique.</p>
+    </div>
+  </div>
+
+  <h3>Comment la détection fonctionne dans le script</h3>
+
+  <p>
+    A chaque round, l'optimisation de la fonction d'acquisition est lancée depuis
+    <strong>N points de départ aléatoires</strong> (multi-start). Normalement, seul
+    le meilleur est retenu. La détection multi-modale conserve aussi les TOP-K
+    meilleurs maxima distincts (distance normalisée &gt; 0.15 entre eux) :
+  </p>
+
+<pre><span class="lang">Terminal — exemple de détection multi-modale</span><code>  ──────────────────────────────────────────────────────────────
+  ESPACE MULTI-MODAL DETECTE — 2 zones prometteuses
+  (seule la meilleure est suggeree — les autres sont listees ici)
+  ──────────────────────────────────────────────────────────────
+  Optimum local #2 (acquisition = 0.0847, <span class="num">73%</span> du meilleur) :
+    Temperature (C)               : <span class="num">71.2</span>
+    Temps (min)                   : <span class="num">54.8</span>
+    Equivalents                   : <span class="num">1.48</span>
+  ──────────────────────────────────────────────────────────────
+  Pour tester un optimum alternatif : ajoutez-le manuellement
+  dans le CSV avec statut = 'fait' apres l'experience.</code></pre>
+
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// Ce que la multi-modalité ne peut pas faire algorithmiquement</div>
+      <p>Le script peut détecter que <em>l'espace d'acquisition est multi-modal</em>,
+      mais il ne peut pas savoir si les deux pics correspondent à deux mécanismes
+      réels ou si l'un est un artefact du GP manquant de données. La décision de
+      tester un optimum alternatif reste humaine — c'est exactement la complémentarité
+      entre l'algorithme et l'expertise chimique.</p>
+    </div>
+  </div>
+
+  <h3>Bilan — que choisir selon la situation</h3>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Situation</th><th>Feature à activer</th><th>YAML</th></tr></thead>
+    <tbody>
+      <tr><td>Rendements très asymétriques (0-5% très fréquents)</td><td>Box-Cox</td><td><code class="i">boxcox: true</code></td></tr>
+      <tr><td>Bruit variable selon la zone testée</td><td>Box-Cox</td><td><code class="i">boxcox: true</code></td></tr>
+      <tr><td>Suspicion de mesure erronée dans le CSV</td><td>Outlier detection</td><td><code class="i">outlier_detection: true</code></td></tr>
+      <tr><td>GP trop optimiste (prédictions très éloignées des mesures)</td><td>Box-Cox + outlier</td><td><code class="inline">boxcox: true</code> + <code class="inline">outlier_detection: true</code></td></tr>
+      <tr><td>Plusieurs zones à >50% dans le dataset</td><td>Multi-modal (K-means + multi-start)</td><td><code class="inline">multimodal_detection: true</code></td></tr>
+      <tr><td>Suggestions toujours aux mêmes coordonnées</td><td>Stagnation (auto)</td><td>Aucun — automatique</td></tr>
+      <tr><td>Suggestions dérivant sans progresser</td><td>Drift (auto)</td><td>Aucun — automatique</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+
+<!-- ══ CH 15 : DASHBOARD & PDP -->
+<section class="chapter" id="ch15">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 15</div>
+    <h2>Dashboard 16:9<br>&amp; PDP — v3.0</h2>
+  </div>
+
+  <h3>Moins de fichiers, plus de lisibilité</h3>
+  <p>
+    Avant v3.0, une campagne de 20 itérations produisait 60+ fichiers PNG
+    (convergence + landscape par round). La v3.0 remplace tout ça par
+    <strong>deux fichiers seulement</strong>, quelle que soit la durée de la campagne.
+  </p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Fichier</th><th>Quand</th><th>Comportement</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code class="i">{campaign}_dashboard.png</code></td>
+        <td>À chaque itération BO</td>
+        <td>Écrasé — toujours à jour</td>
+      </tr>
+      <tr>
+        <td><code class="i">{campaign}_FINAL_report.png</code></td>
+        <td>À la convergence ou <code class="i">--final</code></td>
+        <td>Jamais écrasé — incrémente (_2, _3…)</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>Layout du dashboard — 4 panels en 2×2</h3>
+
+<pre><span class="lang">Layout 16:9</span><code>┌─────────────────────┬─────────────────────┐
+│  Convergence        │  ARD importance     │
+│  (tous les rounds)  │  (barres horiz.)    │
+│  meilleur cumulatif │  par paramètre      │
+├─────────────────────┼─────────────────────┤
+│  Scatter            │  PDP                │
+│  expériences par Y% │  variable la plus   │
+│  + suggestions ★    │  influente          │
+└─────────────────────┴─────────────────────┘</code></pre>
+
+  <div class="note intuition">
+    <div class="note-icon">🖥</div>
+    <div class="note-body">
+      <div class="note-label">// Workflow recommandé</div>
+      <p>Ouvre <code class="i">campaign_dashboard.png</code> dans ton viewer d'images préféré
+      (Windows : Double-clic → la preview se rafraîchit automatiquement à chaque relance).
+      Tu as alors une vue live de la campagne sans chercher quel fichier regarder.
+      Le rapport final s'génère automatiquement à la convergence — ou à la demande.</p>
+    </div>
+  </div>
+
+<pre><span class="lang">bash</span><code><span class="cm"># Générer le rapport final à tout moment</span>
+python bo_chemistry.py config.yaml <span class="fn">--final</span>
+
+<span class="cm"># Réactiver les snapshots per-itération si tu veux l'historique</span>
+<span class="cm"># Dans le YAML :</span>
+<span class="cm">timestamp_outputs: true</span></code></pre>
+
+  <h3>Le PDP — lire l'influence d'une variable</h3>
+  <p>
+    La <strong>courbe de dépendance partielle (PDP)</strong> répond à la question :
+    <em>"Quelle serait la prédiction GP si je faisais varier uniquement cette variable,
+    en maintenant les autres à leur distribution observée ?"</em>
+  </p>
+
+  <div class="note concept">
+    <div class="note-icon">📈</div>
+    <div class="note-body">
+      <div class="note-label">// Méthode de calcul</div>
+      <p>Pour chaque point de la grille de la variable X<sub>i</sub> :</p>
+      <ol style="margin:0.4em 0 0 1.2em;font-size:0.92em">
+        <li>Prendre N échantillons aléatoires des données observées</li>
+        <li>Remplacer la valeur de X<sub>i</sub> par la valeur de la grille</li>
+        <li>Prédire μ(x) avec le GP sur ces N points modifiés</li>
+        <li>Moyenner → valeur PDP au point de grille</li>
+      </ol>
+      <p style="margin-top:0.5em">L'enveloppe ±σ indique la variabilité selon les autres conditions.</p>
+    </div>
+  </div>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Type de variable</th><th>Affichage PDP</th><th>Ce qu'on lit</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Continue (T, t, eq)</td>
+        <td>Courbe avec enveloppe ±σ</td>
+        <td>Zone optimale de la variable + incertitude</td>
+      </tr>
+      <tr>
+        <td>Catégorielle one-hot</td>
+        <td>Bar chart par catégorie</td>
+        <td>Quelle catégorie est prédite meilleure</td>
+      </tr>
+      <tr>
+        <td>Catégorielle encodée physico</td>
+        <td>Bar chart + points observés</td>
+        <td>Idem + corrélation avec les descripteurs (ch.16)</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>Rapport final — 6 panels haute résolution</h3>
+  <p>Déclenché à la convergence ou via <code class="i">--final</code> :</p>
+  <ol style="font-size:0.93em;line-height:1.8">
+    <li><strong>Convergence annotée</strong> — chaque nouveau record est noté sur la courbe</li>
+    <li><strong>ARD finale</strong> — importance définitive des paramètres après optimisation complète</li>
+    <li><strong>PDP normalisé</strong> — toutes les variables continues sur la même échelle [0,1]</li>
+    <li><strong>Landscape GP 2D</strong> — carte de chaleur des 2 variables les plus importantes</li>
+    <li><strong>PDP catégorielle 1</strong> — si encodage physicochimique actif</li>
+    <li><strong>PDP catégorielle 2</strong> — si 2ème variable catégorielle encodée</li>
+  </ol>
+</section>
+
+<!-- ══ CH 16 : ENCODAGE PHYSICOCHIMIQUE -->
+<section class="chapter" id="ch16">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 16</div>
+    <h2>Encodage physicochimique<br>des catégorielles — v3.0</h2>
+  </div>
+
+  <h3>Le problème du one-hot encoding</h3>
+  <p>
+    Avec l'encodage one-hot classique, le GP voit <code class="i">DMF = [1,0,0]</code>,
+    <code class="i">DMAc = [0,1,0]</code>, <code class="i">DMSO = [0,0,1]</code> —
+    trois vecteurs orthogonaux, à distance égale les uns des autres.
+    Le GP ne sait pas que DMF et DMAc sont très similaires (deux amides, ε≈37)
+    et ne peut pas inférer "si DMF marche, DMAc devrait aussi marcher".
+  </p>
+  <p>
+    Avec l'encodage physicochimique, il voit
+    <code class="i">DMF = [36.7, 3.82, 13.7, 11.3]</code> et
+    <code class="i">DMAc = [37.8, 3.72, 11.5, 10.2]</code> — deux points très
+    proches dans l'espace des descripteurs. Le GP apprend une fonction continue
+    sur ces dimensions et peut interpoler.
+  </p>
+
+  <h3>Le fichier descripteurs_chimiques.xlsx</h3>
+  <p>Fourni avec le script. Trois feuilles :</p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Feuille</th><th>Composés</th><th>Descripteurs</th><th>Priorité recommandée</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Solvants</strong></td>
+        <td>22 classiques</td>
+        <td>ε, μ, δD, δP, δH, logP, Eb</td>
+        <td><code class="i">ε, μ, δP, δH</code> — les 4 les plus informatifs</td>
+      </tr>
+      <tr>
+        <td><strong>Bases</strong></td>
+        <td>21 classiques</td>
+        <td>pKa (H₂O + MeCN), encombrement, type</td>
+        <td><code class="i">pKa (H₂O), Encombrement</code></td>
+      </tr>
+      <tr>
+        <td><strong>Ligands</strong></td>
+        <td>21 phosphines + NHC</td>
+        <td>TEP, angle Tolman, %Vbur, σ/π</td>
+        <td><code class="i">TEP, %Vbur</code> — couvrent ~80% de la variance</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>Configuration YAML</h3>
+  <p>Deux paramètres supplémentaires par variable catégorielle :</p>
+
+<pre><span class="lang">YAML</span><code>parameters:
+  <span class="cm"># Variable continue — inchangé</span>
+  - name: <span class="kw">"Temperature (C)"</span>
+    type: continuous
+    min: <span class="num">25</span>
+    max: <span class="num">80</span>
+
+  <span class="cm"># Variable catégorielle AVEC encodage physicochimique</span>
+  - name: <span class="kw">"Solvant"</span>
+    type: categorical
+    categories: [<span class="kw">"DMF"</span>, <span class="kw">"THF"</span>, <span class="kw">"MeCN"</span>, <span class="kw">"Toluene"</span>]
+    descriptors_file:    <span class="kw">"descripteurs_chimiques.xlsx"</span>
+    descriptors_sheet:   <span class="kw">"Solvants"</span>
+    descriptors_columns: [<span class="kw">"ε (25°C)"</span>, <span class="kw">"μ (D)"</span>, <span class="kw">"δP (MPa½)"</span>, <span class="kw">"δH (MPa½)"</span>]
+
+  <span class="cm"># Variable catégorielle SANS encodage — one-hot classique</span>
+  - name: <span class="kw">"Base"</span>
+    type: categorical
+    categories: [<span class="kw">"K2CO3"</span>, <span class="kw">"Cs2CO3"</span>, <span class="kw">"DBU"</span>]
+    <span class="cm"># (pas de descriptors_file → one-hot automatique)</span></code></pre>
+
+  <div class="note warning">
+    <div class="note-icon">⚠️</div>
+    <div class="note-body">
+      <div class="note-label">// Points d'attention</div>
+      <p>Le fichier Excel doit être dans le <strong>même dossier</strong> que le YAML (ou chemin relatif valide).
+      Si une catégorie n'est pas trouvée dans le fichier, le script affiche un avertissement et utilise
+      un vecteur nul — elle sera traitée comme "neutre". Pour ajouter un composé, ajoutez
+      une ligne en bas de la feuille correspondante en suivant le même format.</p>
+    </div>
+  </div>
+
+  <h3>Comment lire le PDP d'une catégorielle encodée</h3>
+  <p>
+    Le dashboard affiche un bar chart avec le rendement prédit par le GP pour chaque catégorie,
+    trié par valeur. Les points noirs sont les mesures réellement observées.
+    Les catégories non encore testées ont une barre mais pas de point — c'est exactement
+    la prédiction GP : <em>"si j'utilisais ce solvant dans ces conditions, je prévoirais X%"</em>.
+  </p>
+
+  <div class="note intuition">
+    <div class="note-icon">💡</div>
+    <div class="note-body">
+      <div class="note-label">// Répondre à "quelle ε est la plus propice ?"</div>
+      <p>Sans encodage physicochimique, impossible de répondre — le GP ignore qu'ε existe.
+      <br>Avec l'encodage, tu vois dans le PDP que les solvants à ε≈30-40 donnent
+      les meilleures prédictions. Tu peux alors ajouter un nouveau solvant non encore testé
+      (ex. DMSO, ε=46.7) dans la liste <code class="i">categories</code> et le GP
+      suggérera de le tester à l'itération suivante — sans l'avoir jamais vu auparavant.</p>
+    </div>
+  </div>
+
+  <h3>Mixer catégorielles encodées et non-encodées</h3>
+  <p>
+    Tu peux avoir dans la même campagne un solvant encodé physicochimiquement
+    et une base en one-hot — les deux modes coexistent sans conflit.
+    Chaque variable catégorielle est traitée indépendamment.
+    Si tu optimises solvant + base simultanément, les deux PDP apparaissent
+    dans le rapport final.
+  </p>
+</section>
+
+
+<!-- ══ CH 17 : NOUVELLES ACQUISITIONS v3.2 -->
+<section class="chapter" id="ch17">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 17</div>
+    <h2>Nouvelles acquisitions<br>&amp; initialisations — v3.2</h2>
+  </div>
+
+  <h3>EI-TS : le meilleur des deux mondes pour les batchs</h3>
+  <p>
+    Quand <code class="i">n_suggestions ≥ 3</code>, le Kriging Believer classique
+    refitte le GP entièrement pour chaque suggestion supplémentaire — lourd et redondant.
+    <strong>EI-TS</strong> (d'après EDBO, Shields &amp; Doyle, Nature 2021) adopte
+    une stratégie hybride :
+  </p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Suggestion</th><th>Méthode</th><th>Logique</th></tr></thead>
+    <tbody>
+      <tr><td><strong>1ère</strong></td><td>Expected Improvement</td><td>Meilleure exploitation connue</td></tr>
+      <tr><td><strong>2ème…n</strong></td><td>Thompson Sampling</td><td>Tirage du posterior — diversité naturelle</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>
+    Résultat : pas de refit entre suggestions, 2-3× plus rapide pour n=3+,
+    et la diversité du batch est assurée naturellement par TS sans contrainte artificielle.
+  </p>
+
+<pre><span class="lang">YAML</span><code>bo_settings:
+  acquisition: <span class="kw">"EI-TS"</span>   <span class="cm"># Recommandé dès que n_suggestions ≥ 3</span>
+  n_suggestions: <span class="num">3</span></code></pre>
+
+  <h3>UCB auto-β : calibration automatique de l'exploration</h3>
+  <p>
+    Notre UCB classique utilise un <code class="i">kappa</code> fixe — un paramètre
+    de plus à régler. <strong>UCB-AUTO</strong> calcule β selon la borne théorique
+    de Srinivas 2010 :
+  </p>
+
+<pre><span class="lang">Formule</span><code>β = √(2 · log(d · t² · π² / 6δ))
+
+d = nombre de dimensions (paramètres)
+t = itération courante        → β augmente avec le temps
+δ = 0.5 (constante théorique)</code></pre>
+
+  <div class="note intuition">
+    <div class="note-icon">📈</div>
+    <div class="note-body">
+      <div class="note-label">// Comportement adaptatif</div>
+      <p>Au début (t petit) : β faible → exploitation favorisée.
+      Après (t grand) : β croît → exploration croissante automatiquement.
+      Plus besoin de choisir kappa.</p>
+    </div>
+  </div>
+
+<pre><span class="lang">YAML</span><code>acquisition: <span class="kw">"UCB-AUTO"</span>   <span class="cm"># Pas de ucb_kappa à régler</span></code></pre>
+
+  <h3>VARMAX : exploration pure forcée</h3>
+  <p>
+    Sélectionne le point de <strong>variance maximale</strong> — là où le GP
+    est le plus incertain. Mode de dernier recours si une stagnation est
+    détectée et que Thompson n'a pas suffi. Aussi utile pour cartographier
+    une zone du paysage délibérément.
+  </p>
+
+<pre><span class="lang">YAML</span><code>acquisition: <span class="kw">"VARMAX"</span>   <span class="cm"># Pure exploration — à utiliser ponctuellement</span></code></pre>
+
+  <h3>Guide de choix des acquisitions — tableau complet</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Acquisition</th><th>Quand l'utiliser</th><th>n_suggest</th></tr></thead>
+    <tbody>
+      <tr><td><code class="i">EI</code></td><td>Défaut — toujours bon</td><td>1–2</td></tr>
+      <tr><td><code class="i">EI-TS</code></td><td>Batchs n≥3 — plus rapide</td><td>3+</td></tr>
+      <tr><td><code class="i">TEI</code></td><td>Paysage multi-modal (10+ iters)</td><td>1–2</td></tr>
+      <tr><td><code class="i">UCB-AUTO</code></td><td>Exploration adaptative sans réglage</td><td>1–2</td></tr>
+      <tr><td><code class="i">Thompson</code></td><td>Auto si stagnation détectée</td><td>auto</td></tr>
+      <tr><td><code class="i">VARMAX</code></td><td>Exploration forcée manuelle</td><td>1</td></tr>
+      <tr><td><code class="i">PI</code></td><td>Budget très limité, gains conservateurs</td><td>1</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>K-means initialisation : couvrir l'espace chimique</h3>
+  <p>
+    Le LHS classique couvre uniformément l'espace des paramètres <em>continus</em>,
+    mais ignore les relations entre variables et les clusters naturels —
+    notamment quand des catégorielles sont encodées physicochimiquement.
+    <strong>K-means init</strong> identifie des clusters dans l'espace encodé
+    complet (incluant ε, TEP, pKa…) et retourne le point le plus proche
+    du centroïde de chaque cluster.
+  </p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th></th><th>LHS</th><th>K-means</th></tr></thead>
+    <tbody>
+      <tr><td>Couverture continues</td><td>✓ Optimale</td><td>✓ Bonne</td></tr>
+      <tr><td>Couverture catégorielles encodées</td><td>✗ Ignorée</td><td>✓ Respecte les clusters chimiques</td></tr>
+      <tr><td>Vitesse</td><td>Très rapide</td><td>Rapide</td></tr>
+      <tr><td>Quand utiliser</td><td>Sans catégorielles encodées</td><td>Avec solvants/ligands/bases encodés</td></tr>
+    </tbody>
+  </table></div>
+
+<pre><span class="lang">YAML</span><code>bo_settings:
+  init_method: <span class="kw">"kmeans"</span>   <span class="cm"># "lhs" (defaut) ou "kmeans"</span></code></pre>
+</section>
+
+
+<!-- ══ CH 18 : ARCHITECTURE GPYTORCH v3.3 -->
+<section class="chapter" id="ch18">
+  <div class="ch-header">
+    <div class="ch-num">// Chapitre 18</div>
+    <h2>Architecture GPyTorch<br>100% — v3.3</h2>
+  </div>
+
+  <h3>Pourquoi passer de sklearn à GPyTorch ?</h3>
+  <p>
+    Le GP sklearn fonctionnait bien, mais avait deux limites structurelles
+    importantes pour les petits datasets chimiques (5–15 points) :
+  </p>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th></th><th>sklearn (v≤3.2)</th><th>GPyTorch (v3.3+)</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Régularisation</strong></td>
+        <td>Bornes fixes <code class="i">(0.01, 5.0)</code> sur les lengthscales</td>
+        <td>GammaPrior(3, 0.5) — prior bayésien qui tire les hyperparamètres vers des valeurs raisonnables</td>
+      </tr>
+      <tr>
+        <td><strong>Bruit</strong></td>
+        <td><code class="i">alpha=0.5</code> fixe</td>
+        <td>GaussianLikelihood — bruit <em>appris</em> depuis les données</td>
+      </tr>
+      <tr>
+        <td><strong>Optimisation</strong></td>
+        <td>DE + L-BFGS-B (déterministe)</td>
+        <td>ADAM (gradient descent, 150 iters × 5 restarts)</td>
+      </tr>
+      <tr>
+        <td><strong>Thompson Sampling</strong></td>
+        <td>Matrice cov 4000×4000 (128 Mo)</td>
+        <td><code class="i">rsample()</code> Lanczos — efficace en mémoire</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>Les GammaPriors — l'impact réel</h3>
+  <p>
+    Les bornes fixes <code class="i">(0.01, 5.0)</code> empêchaient les hyperparamètres
+    de diverger, mais de façon brutale : un lengthscale à la borne était "bloqué"
+    sans information sur la direction à prendre. Le prior <code class="i">GammaPrior(3, 0.5)</code>
+    agit différemment — il <em>tire doucement</em> vers sa valeur modale (≈4 en espace brut)
+    tout en laissant les données s'exprimer.
+  </p>
+
+  <div class="note concept">
+    <div class="note-icon">🎯</div>
+    <div class="note-body">
+      <div class="note-label">// Analogie</div>
+      <p>Les bornes sklearn, c'est une cage. Le prior GPyTorch, c'est un ressort :
+      il ramène vers le centre si on s'éloigne trop, mais laisse la liberté
+      de s'adapter aux données quand celles-ci sont informatives.</p>
+    </div>
+  </div>
+
+  <h3>Le bruit appris — pourquoi c'est important</h3>
+  <p>
+    En synthèse organique, le bruit expérimental varie selon le contexte :
+    une réaction en extrudeur réactif est très reproductible (σ ≈ 2–5%),
+    une amidation en vial manuel l'est moins (σ ≈ 5–10%). Avec
+    <code class="i">GaussianLikelihood</code>, le GP estime ce bruit depuis
+    tes propres données et ajuste son niveau de confiance en conséquence —
+    sans paramètre <code class="i">alpha</code> à calibrer.
+  </p>
+
+  <h3>Installation requise</h3>
+
+<pre><span class="lang">bash</span><code>pip install gpytorch torch</code></pre>
+
+  <p>
+    Si GPyTorch n'est pas installé, le script s'arrête avec un message
+    explicite indiquant la commande à lancer.
+  </p>
+
+  <h3>Paramètres internes — rien à régler</h3>
+
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Paramètre</th><th>Valeur</th><th>Justification</th></tr></thead>
+    <tbody>
+      <tr><td>Kernel</td><td>Matérn 5/2 ARD</td><td>Fonctions deux fois dérivables — adapté aux rendements chimiques lisses</td></tr>
+      <tr><td>Training iters</td><td>150</td><td>Convergence ADAM pour 3–10 paramètres</td></tr>
+      <tr><td>Restarts</td><td>5</td><td>Évite les minima locaux de la log-vraisemblance</td></tr>
+      <tr><td>Learning rate</td><td>0.05</td><td>Stable sur données chimiques (5–50 pts)</td></tr>
+      <tr><td>Prior lengthscale</td><td>Gamma(3, 0.5)</td><td>Même valeur qu'EDBO (Shields 2021)</td></tr>
+      <tr><td>Prior outputscale</td><td>Gamma(3, 0.5)</td><td>Idem</td></tr>
+      <tr><td>Bruit minimum</td><td>1e-4</td><td>Évite la dégénérescence numérique</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note warning">
+    <div class="note-icon">📌</div>
+    <div class="note-body">
+      <div class="note-label">// Ce qui a changé vs v3.2</div>
+      <p>L'option <code class="i">gp_backend</code> a été supprimée du YAML.
+      Il n'y a plus de choix à faire : GPyTorch est le seul backend,
+      toujours actif. Moins d'options = moins d'incertitude sur le bon setup.</p>
+    </div>
+  </div>
+
+  <h3>Résumé de l'architecture v3.3</h3>
+
+<pre><span class="lang">Architecture interne</span><code>build_gp(n_dims)
+  └─ GPModel(n_dims, normalize_y)
+       ├─ _ExactGPModel (GPyTorch ExactGP)
+       │    ├─ ConstantMean
+       │    └─ ScaleKernel(MaternKernel 5/2 ARD)
+       │         ├─ GammaPrior(3, 0.5) sur lengthscales
+       │         └─ GammaPrior(3, 0.5) sur outputscale
+       ├─ GaussianLikelihood (bruit appris)
+       │    └─ GreaterThan(1e-4) contrainte minimale
+       └─ ADAM optimizer (150 iters × 5 restarts)
+            └─ ExactMarginalLogLikelihood</code></pre>
+</section>
+
+
+</div><!-- /main-wrap -->
+
+
+<!-- ════════════════════ SCRIPTS -->
+<script>
+/* ── Reading progress ── */
+window.addEventListener('scroll', () => {
+  const h = document.documentElement;
+  const pct = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+  document.getElementById('prog').style.width = pct + '%';
+});
+
+/* ── Active nav ── */
+const sections = document.querySelectorAll('[id]');
+const navLinks = document.querySelectorAll('.nav-chapter a');
+const obs = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      navLinks.forEach(a => a.classList.remove('active'));
+      const link = document.querySelector(`.nav-chapter a[href="#${e.target.id}"]`);
+      if (link) link.classList.add('active');
+    }
+  });
+}, { threshold: 0.3 });
+sections.forEach(s => obs.observe(s));
+
+/* ════════════════════════════════════════
+   GP INTERACTIVE DEMO
+   ════════════════════════════════════════ */
+const canvas = document.getElementById('gp-canvas');
+const ctx    = canvas.getContext('2d');
+
+let W, H;
+let observations = [];
+let nextSuggestion = null;
+
+function resize() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  W = canvas.width  = rect.width - 56;
+  H = canvas.height = 220;
+  draw();
+}
+
+// True hidden function (normalized to 0-1)
+function trueF(x) {
+  return 0.3 * Math.sin(2.5 * x) + 0.25 * Math.cos(6 * x) + 0.3 * x + 0.2;
+}
+
+// Simple RBF kernel
+function rbfKernel(x1, x2, l=0.25, sigma=0.6) {
+  const d = (x1 - x2) / l;
+  return sigma * sigma * Math.exp(-0.5 * d * d);
+}
+
+function computeGP(xTest, xTrain, yTrain, noise=0.02) {
+  if (xTrain.length === 0) {
+    return xTest.map(() => ({ mu: 0.5, sig: 0.3 }));
+  }
+  const n = xTrain.length;
+  const m = xTest.length;
+
+  // K(X,X) + noise
+  const K = [];
+  for (let i = 0; i < n; i++) {
+    K[i] = [];
+    for (let j = 0; j < n; j++) {
+      K[i][j] = rbfKernel(xTrain[i], xTrain[j]) + (i===j ? noise : 0);
+    }
+  }
+
+  // Simple Cholesky-free inversion for small n using LU
+  const Kinv = invertMatrix(K);
+
+  return xTest.map(xs => {
+    // k(x*, X)
+    const kstar = xTrain.map(xt => rbfKernel(xs, xt));
+    // mu = k* K^-1 y
+    let mu = 0;
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (let j = 0; j < n; j++) sum += Kinv[i][j] * yTrain[j];
+      mu += kstar[i] * sum;
+    }
+    // var = k(x*,x*) - k* K^-1 k*
+    let quad = 0;
+    for (let i = 0; i < n; i++) {
+      let sum = 0;
+      for (let j = 0; j < n; j++) sum += Kinv[i][j] * kstar[j];
+      quad += kstar[i] * sum;
+    }
+    const varr = Math.max(0, rbfKernel(xs, xs) - quad);
+    return { mu: Math.min(1, Math.max(0, mu)), sig: Math.sqrt(varr) };
+  });
+}
+
+function invertMatrix(A) {
+  const n = A.length;
+  const aug = A.map((row, i) => [...row, ...Array(n).fill(0).map((_, j) => i===j ? 1 : 0)]);
+  for (let i = 0; i < n; i++) {
+    let max = Math.abs(aug[i][i]), maxRow = i;
+    for (let k = i+1; k < n; k++) if (Math.abs(aug[k][i]) > max) { max = Math.abs(aug[k][i]); maxRow = k; }
+    [aug[i], aug[maxRow]] = [aug[maxRow], aug[i]];
+    const div = aug[i][i];
+    if (Math.abs(div) < 1e-10) continue;
+    for (let j = 0; j < 2*n; j++) aug[i][j] /= div;
+    for (let k = 0; k < n; k++) {
+      if (k === i) continue;
+      const f = aug[k][i];
+      for (let j = 0; j < 2*n; j++) aug[k][j] -= f * aug[i][j];
+    }
+  }
+  return aug.map(row => row.slice(n));
+}
+
+function computeEI(gpPreds, bestF) {
+  return gpPreds.map(({ mu, sig }) => {
+    if (sig < 1e-6) return 0;
+    const z = (mu - bestF) / sig;
+    const phi = Math.exp(-0.5*z*z) / Math.sqrt(2*Math.PI);
+    const Phi = 0.5 * (1 + erf(z / Math.sqrt(2)));
+    return Math.max(0, (mu - bestF) * Phi + sig * phi);
+  });
+}
+
+function erf(x) {
+  const t = 1/(1+0.3275911*Math.abs(x));
+  const poly = t*(0.254829592+t*(-0.284496736+t*(1.421413741+t*(-1.453152027+t*1.061405429))));
+  const r = 1 - poly * Math.exp(-x*x);
+  return x >= 0 ? r : -r;
+}
+
+let gpCache = null;
+let eiCache = null;
+
+function computeAll() {
+  const N = 200;
+  const xs = Array.from({length: N}, (_, i) => i / (N-1));
+  const xTrain = observations.map(o => o.x);
+  const yTrain = observations.map(o => o.y);
+  gpCache = computeGP(xs, xTrain, yTrain);
+  const bestF = yTrain.length > 0 ? Math.max(...yTrain) : -Infinity;
+  eiCache = computeEI(gpCache, bestF === -Infinity ? 0.5 : bestF);
+  // Find suggested next point
+  if (observations.length > 0) {
+    let maxEI = -1, maxIdx = 0;
+    eiCache.forEach((v, i) => { if (v > maxEI) { maxEI = v; maxIdx = i; } });
+    nextSuggestion = maxIdx / (N-1);
+  } else {
+    nextSuggestion = null;
+  }
+}
+
+function draw() {
+  if (!W) return;
+  ctx.clearRect(0, 0, W, H);
+
+  const PAD = { l: 30, r: 20, t: 20, b: 30 };
+  const pw = W - PAD.l - PAD.r;
+  const ph = H - PAD.t - PAD.b;
+
+  function px(x) { return PAD.l + x * pw; }
+  function py(y) { return PAD.t + (1 - y) * ph; }
+
+  // Background
+  ctx.fillStyle = '#0a0c10';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    ctx.beginPath(); ctx.moveTo(PAD.l, py(i/4)); ctx.lineTo(W-PAD.r, py(i/4)); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(px(i/4), PAD.t); ctx.lineTo(px(i/4), H-PAD.b); ctx.stroke();
+  }
+
+  // Compute if needed
+  if (!gpCache) computeAll();
+
+  const N = gpCache.length;
+  const xs = Array.from({length: N}, (_, i) => i / (N-1));
+
+  // EI band (very faint)
+  if (observations.length > 0 && eiCache) {
+    const maxEI = Math.max(...eiCache);
+    if (maxEI > 0) {
+      ctx.beginPath();
+      xs.forEach((x, i) => {
+        const eiH = (eiCache[i] / maxEI) * 0.3;
+        const yy = py(eiH * 0.8);
+        i === 0 ? ctx.moveTo(px(x), yy) : ctx.lineTo(px(x), yy);
+      });
+      ctx.lineTo(px(xs[N-1]), py(0)); ctx.lineTo(px(xs[0]), py(0)); ctx.closePath();
+      ctx.fillStyle = 'rgba(184,115,51,0.12)';
+      ctx.fill();
+    }
+  }
+
+  // GP uncertainty band
+  ctx.beginPath();
+  xs.forEach((x, i) => {
+    const y = Math.min(1, gpCache[i].mu + 2*gpCache[i].sig);
+    i === 0 ? ctx.moveTo(px(x), py(y)) : ctx.lineTo(px(x), py(y));
+  });
+  xs.slice().reverse().forEach((x, i) => {
+    const ri = N - 1 - i;
+    const y = Math.max(0, gpCache[ri].mu - 2*gpCache[ri].sig);
+    ctx.lineTo(px(x), py(y));
+  });
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(142,200,176,0.12)';
+  ctx.fill();
+
+  // True function
+  ctx.beginPath();
+  xs.forEach((x, i) => {
+    const y = trueF(x);
+    i === 0 ? ctx.moveTo(px(x), py(y)) : ctx.lineTo(px(x), py(y));
+  });
+  ctx.strokeStyle = 'rgba(224,112,80,0.45)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // GP mean
+  ctx.beginPath();
+  xs.forEach((x, i) => {
+    i === 0 ? ctx.moveTo(px(x), py(gpCache[i].mu)) : ctx.lineTo(px(x), py(gpCache[i].mu));
+  });
+  ctx.strokeStyle = '#8ec8b0';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Next suggestion
+  if (nextSuggestion !== null) {
+    ctx.beginPath();
+    ctx.setLineDash([4, 4]);
+    ctx.moveTo(px(nextSuggestion), PAD.t);
+    ctx.lineTo(px(nextSuggestion), H - PAD.b);
+    ctx.strokeStyle = 'rgba(192,96,192,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    const gy = gpCache[Math.round(nextSuggestion * (N-1))];
+    ctx.beginPath();
+    ctx.arc(px(nextSuggestion), py(gy.mu), 7, 0, Math.PI*2);
+    ctx.strokeStyle = '#c060c0';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // Observations
+  observations.forEach(o => {
+    ctx.beginPath();
+    ctx.arc(px(o.x), py(o.y), 5, 0, Math.PI*2);
+    ctx.fillStyle = '#d4a96a';
+    ctx.fill();
+    ctx.strokeStyle = '#0a0c10';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  });
+
+  // Axes
+  ctx.fillStyle = 'rgba(255,255,255,0.2)';
+  ctx.font = '10px JetBrains Mono';
+  ctx.fillText('0', PAD.l - 8, py(0) + 4);
+  ctx.fillText('1', PAD.l - 8, py(1) + 4);
+  ctx.fillText('Paramètre x →', px(0.3), H - 8);
+
+  // Status
+  document.getElementById('gp-status').textContent =
+    observations.length + ' observation' + (observations.length !== 1 ? 's' : '');
+}
+
+canvas.addEventListener('click', e => {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = W / rect.width;
+  const scaleY = H / rect.height;
+  const cx = (e.clientX - rect.left) * scaleX;
+  const cy = (e.clientY - rect.top)  * scaleY;
+  const PAD = { l: 30, r: 20, t: 20, b: 30 };
+  const x = (cx - PAD.l) / (W - PAD.l - PAD.r);
+  const y = 1 - (cy - PAD.t) / (H - PAD.t - PAD.b);
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
+  observations.push({ x: Math.round(x*100)/100, y: Math.round(y*100)/100 });
+  gpCache = null;
+  computeAll();
+  draw();
+});
+
+function resetGP() {
+  observations = [];
+  nextSuggestion = null;
+  gpCache = null;
+  eiCache = null;
+  draw();
+}
+
+function addRandomPoint() {
+  const x = Math.random();
+  const y = trueF(x) + (Math.random() - 0.5) * 0.08;
+  observations.push({ x: Math.round(x*100)/100, y: Math.min(1, Math.max(0, Math.round(y*100)/100)) });
+  gpCache = null;
+  computeAll();
+  draw();
+}
+
+function suggestNext() {
+  if (nextSuggestion === null) { addRandomPoint(); return; }
+  const x = nextSuggestion;
+  const y = trueF(x) + (Math.random() - 0.5) * 0.06;
+  observations.push({ x: Math.round(x*100)/100, y: Math.min(1, Math.max(0, Math.round(y*100)/100)) });
+  gpCache = null;
+  computeAll();
+  draw();
+}
+
+// Init
+window.addEventListener('resize', resize);
+resize();
+setTimeout(resize, 300);
+</script>
+</body>
+
+</html>
