@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# donnees locales
+campaigns/
+
+# assets regeneres (scripts/setup_assets.py)
+static/plotly.min.js
+
+# datasets non redistribuables
+datasets_doyle/
+datasets_summit/
+doyle_descriptors/
+
+# dev / legacy
+bench_*.py
+diag_*.py
+download_*.py
+gui_bo.py
+README_APP.md
+README_GUI.md
+handoff_*.md
+gitignore_proposed.txt
+
+# sorties generees
+*.png
+*.gif
+dashboard*
+*_report.txt
+
+# OS
+Thumbs.db
+desktop.ini
+~$*

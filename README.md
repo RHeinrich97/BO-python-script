@@ -1,318 +1,170 @@
-# bo_chemistry.py
+# BO Chemistry - Bayesian Optimization for Experimental Chemistry
 
-**Bayesian Optimisation for Chemical Synthesis** — a self-contained Python script for optimising reaction conditions with a human-in-the-loop workflow. No GUI, no cloud dependency: one script, one YAML, one CSV.
+Moteur d'optimisation bayésienne conçu pour les campagnes d'expériences en
+chimie de synthèse (couplages, catalyse, photochimie), avec une interface
+desktop pour piloter les campagnes sans ligne de commande.
 
-> Inspired by Lavayssiere, Bantreil & Lamaty, *RSC Mechanochemistry* 2026 and Shields, Stevens, Li et al., *Nature* 2021 (EDBO).
+L'objectif : suggérer les conditions expérimentales les plus prometteuses à
+tester ensuite, à partir des résultats déjà obtenus, pour atteindre un
+rendement (ou tout autre objectif) cible en un minimum d'expériences.
 
----
+> Projet développé dans le cadre de travaux de recherche en chimie organique
+> de synthèse. Le moteur d'optimisation est le cœur du projet ; l'interface
+> desktop est une surcouche pour l'usage quotidien au laboratoire.
 
-## Overview
+<!-- Remplacer par une vraie capture d'ecran de l'app -->
+<!-- ![Interface](docs/screenshot.png) -->
 
-`bo_chemistry.py` wraps a GPyTorch Gaussian Process surrogate model into a practical command-line workflow for synthetic chemists. You define your reaction parameters in a YAML file, fill experimental results into a CSV, and the script proposes the next conditions to test — iterating until convergence.
+## Ce que fait le projet
 
-```
-┌──────────────────────────────────────────────────────┐
-│  1. Edit YAML  →  2. Run  →  3. Fill CSV  →  repeat  │
-│            ↑_________________________________↓        │
-└──────────────────────────────────────────────────────┘
-```
+- **Optimisation bayésienne mono- et multi-objectif** sur des espaces de
+  paramètres mixtes (variables continues comme température/temps, et
+  catégorielles comme ligand/solvant/base).
+- **Autopilot adaptatif** : orchestration automatique de la stratégie
+  d'exploration/exploitation selon l'avancement de la campagne (phases
+  EARLY / MID / LATE).
+- **Descripteurs physico-chimiques** : encodage des variables catégorielles
+  via des propriétés moléculaires (RDKit / xTB / Mordred) plutôt qu'un
+  one-hot, permettant au modèle de généraliser entre composés similaires.
+- **Contraintes expérimentales** : contraintes connues a priori sur les
+  paramètres (somme d'équivalents bornée, ratio entre réactifs, exclusion
+  d'une combinaison infaisable) et contraintes sur les résultats mesurés
+  (limiter un sous-produit tout en l'optimisant). L'acquisition ne propose
+  que des points faisables, et le plan initial les respecte également.
+- **Échelle logarithmique** par variable, pour les grandeurs dont l'effet est
+  log-linéaire (concentration, équivalents, charge catalytique, ratio).
+- **Fiabilité des mesures réglable** : le prior de bruit du GP s'ajuste selon
+  la précision analytique déclarée, ce qui évite que le modèle lisse un vrai
+  pic en le prenant pour du bruit.
+- **Plan initial dimension-aware** : le nombre de points du design LHS tient
+  compte des variables continues et du nombre de niveaux catégoriels, avec un
+  critère maximin pour la couverture.
+- **Interface desktop** : création de campagnes, saisie des résultats,
+  suggestions, visualisation de la convergence et de la fonction
+  d'acquisition, récapitulatif du coût expérimental avant lancement, le tout
+  hors-ligne.
 
-**Key design choices:**
-- **No web interface, no database** — everything is a plain CSV you can open in Excel
-- **Single file** — copy `bo_chemistry.py` next to your YAML and you're done
-- **GPyTorch GP** — GammaPriors, learned noise, ADAM optimiser (same backbone as EDBO)
-- **Physicochemical encoding** — solvents, bases and ligands encoded with real descriptors (ε, pKa, TEP…) instead of one-hot vectors, so the GP understands that DMF and DMAc are similar
+## Stack technique
 
----
-
-## Requirements
-
-```bash
-pip install numpy pandas scipy scikit-learn pyyaml matplotlib gpytorch torch
-```
-
-Python ≥ 3.9. GPU not required — CPU runs comfortably for typical chemistry campaigns of 5–50 experiments.
-
----
-
-## Quick start
-
-```bash
-# 1. Copy the template config and rename it
-cp config_test.yaml my_reaction.yaml
-
-# 2. Edit my_reaction.yaml — set your parameters and outputs
-
-# 3. First run — creates the CSV and suggests initial experiments
-python bo_chemistry.py my_reaction.yaml --init-doe
-
-# 4. Fill your experimental results in the CSV (set statut → 'fait')
-
-# 5. Run again — suggests next conditions
-python bo_chemistry.py my_reaction.yaml
-
-# 6. Repeat until convergence
-```
-
----
-
-## Repository contents
-
-| File | Description |
+| Domaine | Outils |
 |---|---|
-| `bo_chemistry.py` | Main optimisation script (v3.3) |
-| `config_test.yaml` | Annotated configuration template |
-| `descripteurs_chimiques.xlsx` | Physicochemical descriptor database (22 solvents, 21 bases, 21 ligands) |
-| `bayes_learning_guide_v3.html` | 18-chapter interactive learning guide |
+| Modèle | Gaussian Process (GPyTorch / PyTorch), noyau Matérn ARD |
+| Acquisitions | EI, UCB, PI, Thompson, TEI, EI-TS, EHVI / qNEHVI (multi-objectif) |
+| Méthodes avancées | TuRBO (trust region), Box-Cox warping, prior mean injection, input warping Kumaraswamy |
+| Contraintes | Contraintes connues a priori (acquisition contrainte) et contraintes sur sorties mesurées (un GP par contrainte) |
+| Descripteurs | RDKit, xTB, Mordred, morfeus |
+| Interface | pywebview (desktop natif), HTML/CSS/JS, Plotly.js |
+| Data | NumPy, pandas, scikit-learn, SciPy |
 
----
+## Aperçu technique du moteur
 
-## Configuration (YAML)
+Le moteur (`bo_chemistry.py`) implémente une boucle d'optimisation bayésienne
+complète :
 
-The YAML is the only file you edit between campaigns. A minimal setup:
+1. **Encodage** d'un espace de paramètres mixtes (continu + catégoriel) vers
+   un espace numérique normalisé, avec support optionnel de descripteurs
+   physico-chimiques pour les catégoriels.
+2. **Modèle de substitution** : Gaussian Process GPyTorch avec bruit appris,
+   priors Gamma, noyau Matérn 5/2 ARD (ou noyau composite cont x cat). Les
+   priors de bruit sont calibrés sur `y` standardisé : un prior réglé pour
+   l'échelle brute conduit le GP à surestimer le bruit et à écraser les
+   meilleurs points (voir changelog v3.9).
+3. **Fonction d'acquisition** sélectionnée selon le contexte (autopilot) ou
+   choisie manuellement, optimisée par recherche multi-start.
+4. **Stratégies de robustesse** : détection de stagnation, de dérive,
+   d'outliers ; trust region adaptative ; filtrage anti-duplication des
+   batchs.
 
-```yaml
-campaign_name: "acylation_ball_mill"
+L'autopilot calcule à chaque itération un `progress` (best / target) et une
+`coverage` (fraction de l'espace explorée), et bascule la stratégie
+d'acquisition en conséquence.
 
-parameters:
-  - name: "Temperature (C)"
-    type: continuous
-    min: 25
-    max: 80
+### Contraintes
 
-  - name: "Temps de reaction (min)"
-    type: continuous
-    min: 15
-    max: 120
+Deux familles sont gérées, selon la distinction établie par Hickman, Aldeghi,
+Häse et Aspuru-Guzik (*Bayesian Optimization with Known Experimental and
+Design Constraints for Chemistry Applications*, Digital Discovery 2022, 1,
+732) :
 
-  - name: "Equivalents acyl chloride"
-    type: continuous
-    min: 1.0
-    max: 3.0
+- **Contraintes connues a priori** (`constraints` dans le YAML) : des
+  expressions booléennes sur les paramètres, évaluées avant toute expérience.
+  L'optimisation de la fonction d'acquisition est restreinte au domaine
+  faisable, et le design initial est filtré de la même façon. Elles encodent
+  les limites de l'équipement ou du procédé, et plus largement la
+  connaissance experte du chimiste.
+- **Contraintes sur sorties mesurées** (`soft_constraints`) : un GP par
+  contrainte modélise la probabilité de satisfaction, pondérant l'acquisition
+  (approche Gardner / Gelbart). Utile quand la quantité contrainte n'est
+  connue qu'après l'expérience, par exemple un sous-produit à maintenir sous
+  un seuil.
 
-outputs:
-  - name: "Rendement (%)"
-    direction: maximize
-    weight: 1.0
+## Validation
 
-bo_settings:
-  n_suggestions: 2
-  acquisition: "EI"
-  n_restarts: 50
-  boxcox: true
-```
+Le moteur a été validé sur des jeux de données HTE publiés (Reizman-Jensen
+Suzuki, Doyle Buchwald-Hartwig) en émulation, ainsi que sur des fonctions de
+benchmark synthétiques. Sur le couplage Doyle (4 dimensions catégorielles),
+l'optimiseur avec descripteurs RDKit atteint ~96 % de rendement en 30
+expériences, contre ~88 % pour un échantillonnage aléatoire.
 
-### Physicochemical encoding of categorical variables
+> Note : les datasets ne sont pas redistribués dans ce dépôt. Voir
+> `scripts/download_datasets.py` pour les récupérer depuis leurs sources.
 
-Instead of one-hot encoding (which treats DMF and DMAc as orthogonal), you can encode solvents, bases and ligands with their real physicochemical properties. The GP then learns that compounds with similar descriptors behave similarly — and can extrapolate to untested compounds.
-
-```yaml
-parameters:
-  - name: "Solvant"
-    type: categorical
-    categories: ["DMF", "THF", "MeCN", "Toluene"]
-    descriptors_file:    "descripteurs_chimiques.xlsx"
-    descriptors_sheet:   "Solvants"
-    descriptors_columns: ["ε (25°C)", "μ (D)", "δP (MPa½)", "δH (MPa½)"]
-
-  - name: "Base"
-    type: categorical
-    categories: ["K2CO3", "Cs2CO3", "DBU", "DIPEA"]
-    descriptors_file:    "descripteurs_chimiques.xlsx"
-    descriptors_sheet:   "Bases"
-    descriptors_columns: ["pKa (H₂O)", "Encombrement"]
-
-  - name: "Ligand"
-    type: categorical
-    categories: ["PPh3", "PCy3", "SPhos", "XPhos"]
-    descriptors_file:    "descripteurs_chimiques.xlsx"
-    descriptors_sheet:   "Ligands"
-    descriptors_columns: ["TEP (cm⁻¹)", "%Vbur (3.5Å)"]
-```
-
-The `descripteurs_chimiques.xlsx` file ships with the repository. Add your own compounds by appending rows to the relevant sheet — the script falls back to one-hot encoding with a warning if a compound is not found.
-
----
-
-## Acquisition functions
-
-| Key | Method | When to use |
-|---|---|---|
-| `"EI"` | Expected Improvement | Default — always a good choice |
-| `"EI-TS"` | EI-TS hybrid (EDBO) | Batch n ≥ 3 — faster, natural diversity |
-| `"TEI"` | Tempered EI (Lavayssiere 2026) | Multimodal landscapes, after ~10 iterations |
-| `"UCB-AUTO"` | UCB with auto-β (Srinivas 2010) | Adaptive exploration without tuning κ |
-| `"Thompson"` | Thompson Sampling | Auto-triggered on stagnation |
-| `"VARMAX"` | Variance maximisation | Forced exploration of unknown regions |
-| `"PI"` | Probability of Improvement | Very limited budget, conservative gains |
-
-**EI-TS** is the recommended choice for batch experiments (n ≥ 3): EI selects the best exploitation point, then Thompson Sampling independently draws the remaining n−1 suggestions from the GP posterior — 2–3× faster than Kriging Believer with equivalent diversity.
-
-**TEI** reduces redundant sampling near already-exploited regions by multiplying EI by a sigmoid factor g(x, β) that depends on the GP prediction at each point. On multimodal benchmarks it continues improving when EI plateaus. The advantage over EI becomes visible after ~10–12 iterations.
-
----
-
-## Multi-objective optimisation
-
-```yaml
-outputs:
-  - name: "Rendement (%)"
-    direction: maximize
-    weight: 0.6
-
-  - name: "ee (%)"
-    direction: maximize
-    weight: 0.4
-    threshold: 90        # must exceed 90% before yield is optimised
-
-bo_settings:
-  multi_objective_mode: "weighted_sum"   # or "pareto", "threshold", "ehvi"
-```
-
-Four modes are available:
-
-- **`weighted_sum`** — linear combination of objectives with user-defined weights
-- **`pareto`** — ParEGO with random weight vectors, traces the Pareto front
-- **`threshold`** — constrained optimisation: some objectives must meet a threshold before others are optimised
-- **`ehvi`** — MC-Expected Hypervolume Improvement (pure NumPy, no extra dependencies), theoretically superior for 2–3 objectives
-
----
-
-## Initialisation strategies
+## Installation
 
 ```bash
-# LHS (Latin Hypercube Sampling) — default
-python bo_chemistry.py my_reaction.yaml --init-doe
+git clone <url-du-repo>
+cd bo-chemistry
+pip install -r requirements.txt
 
-# Specify number of initial experiments
-python bo_chemistry.py my_reaction.yaml --init-doe --doe-n 9
+# Plotly.js (interface) - telecharge la librairie de graphes
+python scripts/setup_assets.py
 ```
 
-```yaml
-bo_settings:
-  init_method: "lhs"      # uniform coverage (default)
-  # init_method: "kmeans" # k-means on encoded space — better when
-                          # categoricals are physicochemically encoded
+## Lancement
+
+**Interface desktop :**
+```bash
+python app_bo.py
 ```
 
-K-means initialisation clusters the full encoded space (including physicochemical descriptors) and selects the point closest to each centroid. This ensures the initial experiments cover chemically distinct regions rather than a uniform grid — particularly relevant when ligands or solvents span very different electronic/steric spaces.
-
----
-
-## Automatic failure detection
-
-The script monitors the optimisation trajectory and adjusts automatically:
-
-| Detector | What it catches | Response |
-|---|---|---|
-| `stagnation_detection` | A variable is stuck across rounds | Switch to Thompson + n=3 |
-| `drift_detection` | A variable drifts without improvement | Switch to UCB κ=0.2 |
-| `outlier_detection` | Measurements inconsistent with GP (LOO) | Flag in report |
-| `boundary_saturation` | Suggestions pile up at parameter bounds | Warning |
-| `multimodal_detection` | Multiple acquisition peaks | Multi-start optimisation |
-
-All detectors are optional and independent. Enable them individually in the YAML:
-
-```yaml
-bo_settings:
-  stagnation_detection: true
-  stagnation_patience:  3
-  drift_detection:      true
-  drift_patience:       3
-  outlier_detection:    false   # computationally expensive (N GP refits)
+**Moteur en ligne de commande :**
+```bash
+python bo_chemistry.py ma_campagne.yaml
 ```
 
----
-
-## Outputs
-
-Every run produces or updates:
+## Structure du dépôt
 
 ```
-campaign_dashboard.png      ← always overwritten, always current
-campaign_FINAL_report.png   ← generated at convergence or with --final
-campaign_iter_XX_report.txt
-campaign.csv
+.
+├── bo_chemistry.py          # moteur d'optimisation bayesienne
+├── app_bo.py                # backend de l'interface desktop
+├── static/
+│   └── index.html           # interface (HTML/CSS/JS)
+├── tests/                   # suite de tests (47 tests)
+├── scripts/                 # utilitaires (descripteurs, setup)
+├── docs/                    # documentation et guide
+└── requirements.txt
 ```
 
-The **dashboard** is a 16:9 PNG with four panels:
-
-- **Convergence** — best-so-far curve annotated at each new record
-- **ARD importance** — which parameters the GP considers most influential
-- **Scatter** — all experiments coloured by yield, with current suggestions marked ★
-- **PDP** — Partial Dependence Plot of the most influential variable (continuous: curve ±σ; encoded categorical: bar chart with observed points overlaid)
+## Tests
 
 ```bash
-# Generate high-resolution final report at any time
-python bo_chemistry.py my_reaction.yaml --final
-
-# Read-only status summary (no new suggestions)
-python bo_chemistry.py my_reaction.yaml --status
-
-# Benchmark acquisition functions on your current data
-python bo_chemistry.py my_reaction.yaml --benchmark
+cd tests
+python run_tests.py
 ```
 
----
+## Limites connues
 
-## GP architecture (v3.3)
+- Le bénéfice de l'optimisation bayésienne dépend du problème : sur des
+  espaces petits ou des réactions à fort gradient évident, un plan
+  d'expériences classique peut suffire. L'approche est la plus utile sur des
+  espaces mixtes avec interactions non triviales et un coût expérimental élevé.
+- Les descripteurs RDKit seuls capturent une partie du signal ; les
+  descripteurs électroniques (xTB) apportent un gain mesurable mais
+  nécessitent une installation plus lourde.
+- Le moteur est un fichier monolithique conséquent ; une refonte modulaire
+  est envisagée (voir `docs/architecture.md`).
 
-```
-GPModel
-├── Kernel  : Matérn 5/2 ARD
-│              GammaPrior(3, 0.5) on lengthscales   ← Bayesian regularisation
-│              GammaPrior(3, 0.5) on outputscale
-├── Noise   : GaussianLikelihood                     ← learned from data
-└── Optim.  : ADAM  ×  150 iterations  ×  5 restarts
-               ExactMarginalLogLikelihood
-```
+## Licence
 
-**Why GPyTorch instead of sklearn?** sklearn's GP uses fixed bounds on lengthscales to prevent divergence — effective but blunt. GPyTorch uses GammaPriors that *gently pull* hyperparameters toward reasonable values while letting the data speak. With 5–15 training points (the typical chemistry regime), this makes a material difference in the quality of predictions. The noise level is also learned from data rather than fixed, so the GP automatically adapts its confidence to experimental reproducibility.
-
-All GP hyperparameters are set internally — nothing to configure in the YAML.
-
----
-
-## Descriptor database
-
-`descripteurs_chimiques.xlsx` covers the most common reagents in organic synthesis and catalysis:
-
-| Sheet | Compounds | Descriptors |
-|---|---|---|
-| **Solvants** | 22 solvents | ε (25°C), μ (D), δD/δP/δH (Hansen), log P, Eb |
-| **Bases** | 21 bases | pKa (H₂O + MeCN Bordwell scale), steric hindrance score, nucleophilicity |
-| **Ligands** | 21 phosphines + NHCs | TEP (cm⁻¹), Tolman cone angle (°), %V_bur at 3.5 Å |
-
-Sources: CRC Handbook, Bordwell pKa tables, Tolman (1977), SambVca (Cavallo), Clavier & Nolan *Chem. Soc. Rev.* 2010.
-
-To add a compound: append a row to the relevant sheet following the existing format. Columns marked `n.d.` are accepted (treated as zero).
-
----
-
-## References
-
-- Lavayssiere M., Bantreil X., Lamaty F. *RSC Mechanochemistry* 2026 — TEI acquisition function, diversity filter
-- Shields B.J., Stevens J., Li J. et al. *Nature* **590**, 89–96 (2021) — EDBO framework, EI-TS, Kriging Believer
-- Gardner J.R. et al. *NeurIPS* 2018 — GPyTorch
-- Srinivas N. et al. *ICML* 2010 — UCB theoretical bound (auto-β)
-- Hansen C.M. *Hansen Solubility Parameters: A User's Handbook*, 2007
-- Tolman C.A. *Chem. Rev.* **77**, 313–348 (1977) — TEP, cone angle
-- Clavier H., Nolan S.P. *Chem. Soc. Rev.* **39**, 3305 (2010) — %V_bur
-
----
-
-## Changelog
-
-| Version | Highlights |
-|---|---|
-| v2.9 | MinMax normalisation, alpha=0.5, ls_bounds, differential_evolution optimiser |
-| v3.0 | Dashboard 16:9 (single overwritten file), PDP, physicochemical encoding |
-| v3.1 | TEI acquisition (Lavayssiere 2026), diversity filter, domain reduction (opt-in) |
-| v3.2 | EI-TS hybrid, UCB auto-β, VARMAX pure exploration, k-means initialisation |
-| v3.3 | 100% GPyTorch — GammaPriors, learned noise, ADAM, efficient Thompson Sampling |
-
----
-
-## License
-
-Have fun with this
+MIT - voir [LICENSE](LICENSE).

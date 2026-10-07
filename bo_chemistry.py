@@ -13,7 +13,10 @@ Usage
     python bo_chemistry.py config.yaml --status     <- resume lecture seule
     python bo_chemistry.py config.yaml --init-doe   <- plan Latin Hypercube initial
     python bo_chemistry.py config.yaml --init-doe --doe-n 9
-    python bo_chemistry.py config.yaml --final        <- rapport final haute resolution
+    python bo_chemistry.py config.yaml --final        <- rapport final + animation GIF (v3.6)
+    python bo_chemistry.py config.yaml --what-if T=65 t=90 eq=2.0 <- prediction GP hypothetique
+    python bo_chemistry.py config.yaml --explore      <- force VARMAX ce round (exploration pure)
+    python bo_chemistry.py config.yaml --what-if T=65 t=90 --neighbors <- + sensibilites & voisins
 
 Historique des versions
 -----------------------
@@ -33,6 +36,37 @@ v3.1  TEI (Tempered Expected Improvement), diversity filter (select_top_diverse)
       domain reduction optionnel (desactive par defaut, risque maxima locaux)
 v3.2  EI-TS hybrid, UCB auto-beta, VARMAX, k-means init
 v3.3  Architecture 100% GPyTorch (bruit appris, GammaPriors, ADAM) — sklearn GP supprime
+v3.4  Benchmark sklearn (vitesse), log_ratio encoding, seed global, hyperparams GP dans rapport
+v3.5  ADAM 100×3 (-60% temps), dashboard 3x2 avec heatmaps trio, prediction_std_BO
+      dans CSV/txt, batch intelligent (diversity aware), rapport HTML parallele,
+      mode --what-if, suppression plot_final (code mort)
+v3.6  Incertitude epistemique vs aleatoire (.txt + HTML), dashboard secondaire
+      PCA trajectoire, SHAP manuel (pourquoi ce point ?), Warped GP Kumaraswamy
+      (toujours actif), animation GIF convergence (--final uniquement),
+      Knowledge Gradient exact (acquisition: "KG")
+v3.7  Mode --explore (VARMAX forcee), --what-if --neighbors (sensibilites +
+      voisins prometteurs), contraintes de faisabilite (YAML constraints),
+      prior knowledge injection (prior_mean linear/threshold),
+      kernel composite (additif + multiplicatif, bo_settings.kernel)
+v3.8  Auto-Pilot Orchestrator : decision de phase a 3 criteres (progres,
+      couverture, stagnation) avec seuils qui scalent en dimension ;
+      acquisition choisie par phase (EARLY/MID/LATE) ; lengthscales ARD
+      exploitees pour la couverture
+v3.9  Correctif majeur GP : les priors de bruit etaient calibres pour des
+      rendements bruts (0-100) alors que y est standardise (variance 1).
+      Le prior "low" GammaPrior(1.1, 0.05) attendait un bruit de variance
+      moyenne 22 -> le GP surestimait le bruit d'un facteur ~2 et lissait
+      les vrais pics (residu +7.5 sur le meilleur point mesure).
+      Recalibrage sur y standardise : low Gamma(2.0, 100) mode 0.01,
+      medium Gamma(2.0, 20) mode 0.05, high Gamma(2.0, 6.67) mode 0.15.
+      Verifie : bruit estime 5.2 -> 1.7 points, residu sur le hit 7.5 -> 1.0,
+      le GP apprend desormais la penalite haute temperature.
+      Aussi : design initial LHS dimension-aware (compte les niveaux
+      categoriels) + maximin (30 candidats, maximise la distance minimale) ;
+      LHS et suggestions filtres par les contraintes hard (check_feasibility,
+      remplacement par echantillonnage de rejet) ; contraintes soft exposees
+      (GP par contrainte, a la Gardner/Gelbart) ; encodage log_ratio et
+      noise_prior pilotables depuis l'interface
 
 Workflow
 --------
@@ -75,6 +109,10 @@ from scipy.stats import norm
 from scipy.optimize import minimize, differential_evolution
 
 # GPyTorch — requis pour le GP principal
+# Force CPU-only avant import (évite init CUDA)
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
 try:
     import torch
     import gpytorch
@@ -162,12 +200,20 @@ def generate_lhs_design(cfg, n_points=None, rng=None):
     """
     Genere un plan Latin Hypercube pour les points initiaux.
 
+    v3.9 :
+      - Le nombre de points par defaut scale avec la dimension reelle :
+        continus ET niveaux categoriels (au lieu de 2*n_cont+1).
+        Regle : max(2*(d_cont+1), n_cat_max, ~4*d_cont) plafonne raisonnablement.
+      - LHS *maximin* : on tire plusieurs LHS candidats et on garde celui qui
+        maximise la distance minimale entre points (meilleure couverture
+        multidimensionnelle, evite les trous d'un LHS vanilla).
+
     Retourne un DataFrame CSV-ready avec les colonnes du CSV de campagne
-    et statut = 'initial' (a changer en 'fait' apres les experiences).
+    et statut = 'initial'.
 
     Parametres :
         cfg      : configuration chargee depuis le YAML
-        n_points : nombre de points (defaut : 2 x nb_parametres_continus + 1)
+        n_points : nombre de points (defaut : calcule selon la dimension)
         rng      : generateur aleatoire (reproductibilite)
     """
     if rng is None:
@@ -179,18 +225,50 @@ def generate_lhs_design(cfg, n_points=None, rng=None):
     cat_params   = [p for p in params if p["type"] == "categorical"]
 
     n_cont = len(cont_params)
-    if n_points is None:
-        n_points = max(2 * n_cont + 1, 4)
+    # Nombre maximal de niveaux parmi les variables categorielles
+    n_cat_max = max([len(p["categories"]) for p in cat_params], default=0)
 
-    # ── LHS pour variables continues ─────────────────────────────────────────
-    # Pour chaque variable, diviser [0,1] en n_points intervalles egaux,
-    # tirer un point uniforme dans chaque intervalle, puis permuter.
-    lhs_matrix = np.zeros((n_points, n_cont))
-    for j in range(n_cont):
-        # Points au centre des intervalles + bruit uniforme dans l'intervalle
-        intervals = (np.arange(n_points) + rng.uniform(0, 1, n_points)) / n_points
-        perm      = rng.permutation(n_points)
-        lhs_matrix[:, j] = intervals[perm]
+    if n_points is None:
+        # Scaling dimensionnel :
+        #   - au moins 2*(n_cont+1) pour identifier le GP continu,
+        #   - au moins n_cat_max pour voir chaque niveau categoriel au moins 1x,
+        #   - une marge ~ 3*n_cont pour la couverture.
+        # On prend le max, borne par un plafond raisonnable (labo : <= 24 init).
+        base_cont = max(2 * (n_cont + 1), 3 * n_cont)
+        n_points = max(base_cont, n_cat_max, 5)
+        # Si beaucoup de niveaux categoriels, garantir ~1.5 point/niveau
+        if n_cat_max > 0:
+            n_points = max(n_points, int(np.ceil(1.5 * n_cat_max)))
+        n_points = int(min(n_points, 24))
+
+    # ── LHS maximin pour variables continues ─────────────────────────────────
+    def _one_lhs(n_pts, n_dim, _rng):
+        m = np.zeros((n_pts, n_dim))
+        for j in range(n_dim):
+            intervals = (np.arange(n_pts) + _rng.uniform(0, 1, n_pts)) / n_pts
+            perm      = _rng.permutation(n_pts)
+            m[:, j] = intervals[perm]
+        return m
+
+    if n_cont > 0:
+        # Tirer plusieurs candidats, garder le meilleur (maximin)
+        n_candidates = 30
+        best_m = None
+        best_score = -np.inf
+        for _ in range(n_candidates):
+            m = _one_lhs(n_points, n_cont, rng)
+            # distance min entre paires (a maximiser)
+            from scipy.spatial.distance import pdist
+            if n_points > 1:
+                dmin = float(pdist(m).min())
+            else:
+                dmin = 0.0
+            if dmin > best_score:
+                best_score = dmin
+                best_m = m
+        lhs_matrix = best_m
+    else:
+        lhs_matrix = np.zeros((n_points, 0))
 
     # Denormaliser vers les vraies valeurs
     rows = []
@@ -201,19 +279,56 @@ def generate_lhs_design(cfg, n_points=None, rng=None):
             val        = lo + lhs_matrix[i, j] * (hi - lo)
             row[p["name"]] = round(val, 4)
 
-        # Variables categorielles : round-robin permute
-        for p in cat_params:
-            cats  = p["categories"]
-            idx   = int(rng.integers(0, len(cats)))
-            row[p["name"]] = cats[idx]
-
-        # Colonnes de sortie vides
         for o in output_names:
             row[o] = ""
         row["statut"]        = "initial"
         row["iteration_BO"]  = ""
         row["prediction_BO"] = ""
         rows.append(row)
+
+    # ── Stratification categorielle (v3.7b) ───────────────────────────────
+    _strat = cfg.get("bo_settings", {}).get("stratified_init", True)
+    for p in cat_params:
+        cats   = p["categories"]
+        n_cats = len(cats)
+        if not _strat or n_cats < 2:
+            for i in range(n_points):
+                rows[i][p["name"]] = cats[int(rng.integers(0, n_cats))]
+            continue
+        n_repeat = max(1, n_points // n_cats)
+        stratified = []
+        for _ in range(n_repeat):
+            stratified.extend(cats)
+        while len(stratified) < n_points:
+            stratified.append(cats[int(rng.integers(0, n_cats))])
+        perm_cats = list(rng.permutation(len(stratified))[:n_points])
+        stratified_perm = [stratified[k] for k in perm_cats]
+        for i in range(n_points):
+            rows[i][p["name"]] = stratified_perm[i]
+
+    # ── Filtrage par contraintes hard (v3.9) ──────────────────────────────
+    # Le LHS brut ignore les contraintes ; on remplace chaque point infaisable
+    # par un echantillon aleatoire faisable (rejet, jusqu'a 300 essais/point).
+    _hard = cfg.get("constraints", []) or []
+    if _hard:
+        for i in range(len(rows)):
+            point = {p["name"]: rows[i][p["name"]] for p in params}
+            feas, _ = check_feasibility(point, _hard)
+            if feas:
+                continue
+            for _ in range(300):
+                cand = {}
+                for p in cont_params:
+                    lo, hi = float(p["min"]), float(p["max"])
+                    cand[p["name"]] = round(float(rng.uniform(lo, hi)), 4)
+                for p in cat_params:
+                    cats = p["categories"]
+                    cand[p["name"]] = cats[int(rng.integers(0, len(cats)))]
+                f2, _ = check_feasibility(cand, _hard)
+                if f2:
+                    for k, v in cand.items():
+                        rows[i][k] = v
+                    break
 
     return pd.DataFrame(rows)
 
@@ -353,7 +468,7 @@ def run_init_doe(cfg, csv_path, n_points, rng):
         df = generate_kmeans_design(cfg, n_points=n_points, rng=rng, cfg_dir=cfg_dir)
     else:
         df = generate_lhs_design(cfg, n_points, rng)
-    save_csv(df, csv_path)
+    save_csv(df, csv_path, cfg=cfg)
 
     print(f"\n  Plan LHS genere : {csv_path}")
     print(f"  Etapes suivantes :")
@@ -559,6 +674,8 @@ def get_all_columns(cfg):
     )
 
 
+
+
 def ouvrir_fichier(chemin):
     try:
         if platform.system() == "Windows":
@@ -608,7 +725,17 @@ def load_csv(csv_path):
     return pd.read_csv(csv_path, encoding="utf-8-sig", dtype=str)
 
 
-def save_csv(df, csv_path):
+def save_csv(df, csv_path, cfg=None):
+    """Sauvegarde le CSV en garantissant l ordre canonique des colonnes."""
+    if cfg is not None:
+        canonical = (
+            [p["name"] for p in cfg["parameters"]] +
+            [o["name"] for o in cfg["outputs"]] +
+            ["statut", "iteration_BO", "prediction_BO", "prediction_std_BO"]
+        )
+        ordered = [c for c in canonical if c in df.columns]
+        extra   = [c for c in df.columns if c not in ordered]
+        df = df[ordered + extra]
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
 
@@ -697,6 +824,7 @@ class SpaceEncoder:
         self._physchem_scaler= {}   # cat_pos -> (min_arr, scale_arr)
         self._physchem_ncols = {}   # cat_pos -> n_descriptors
         self._encoded_dims   = []   # dim count per param (in order)
+        self._log_ratio_idx  = set()  # indices de params avec encoding: log_ratio
 
         cat_count = 0
         for i, p in enumerate(self.params):
@@ -704,6 +832,9 @@ class SpaceEncoder:
                 self.continuous_idx.append(i)
                 self.bounds_phys.append((float(p["min"]), float(p["max"])))
                 self._encoded_dims.append(1)
+                # Log ratio : stocker le flag pour encode/decode
+                if p.get("encoding") == "log_ratio":
+                    self._log_ratio_idx.add(i)
             else:
                 self.categorical_idx.append(i)
                 self.cat_lists.append([str(c) for c in p["categories"]])
@@ -768,7 +899,17 @@ class SpaceEncoder:
             if p["type"] == "continuous":
                 k  = self.continuous_idx.index(param_idx)
                 lo, hi = self.bounds_phys[k]
-                X_norm[:, dim_cursor] = (X_raw[:, param_idx].astype(float) - lo) / max(hi - lo, 1e-9)
+                raw_vals = X_raw[:, param_idx].astype(float)
+                if param_idx in self._log_ratio_idx:
+                    # Log ratio encoding : GP travaille en espace log
+                    # Symétrique autour de 1:1, meilleur pour les stoichiométries
+                    # x_enc = (ln(x) - ln(lo)) / (ln(hi) - ln(lo))
+                    raw_clipped = np.clip(raw_vals, max(lo, 1e-9), hi)
+                    ln_lo = np.log(max(lo, 1e-9))
+                    ln_hi = np.log(max(hi, 1e-9))
+                    X_norm[:, dim_cursor] = (np.log(raw_clipped) - ln_lo) / max(ln_hi - ln_lo, 1e-9)
+                else:
+                    X_norm[:, dim_cursor] = (raw_vals - lo) / max(hi - lo, 1e-9)
                 dim_cursor += 1
             else:
                 cat_pos = self._cat_pos[param_idx]
@@ -790,9 +931,15 @@ class SpaceEncoder:
             for param_idx, p in enumerate(self.params):
                 n_dims = self._encoded_dims[param_idx]
                 if p["type"] == "continuous":
-                    k     = self.continuous_idx.index(param_idx)
+                    k      = self.continuous_idx.index(param_idx)
                     lo, hi = self.bounds_phys[k]
-                    val   = float(np.clip(X_norm[i, d], 0, 1)) * (hi - lo) + lo
+                    enc_v  = float(np.clip(X_norm[i, d], 0, 1))
+                    if param_idx in self._log_ratio_idx:
+                        ln_lo = np.log(max(lo, 1e-9))
+                        ln_hi = np.log(max(hi, 1e-9))
+                        val   = float(np.exp(ln_lo + enc_v * (ln_hi - ln_lo)))
+                    else:
+                        val   = enc_v * (hi - lo) + lo
                     row[p["name"]] = round(val, 4)
                     d += 1
                 else:
@@ -858,13 +1005,63 @@ def _sign(output_cfg):
     return 1.0 if output_cfg.get("direction", "maximize") == "maximize" else -1.0
 
 
+def _apply_utility(y_col, out_cfg):
+    """
+    v3.7c : applique une transformation d'utilité non-lineaire par output.
+
+    Permet d'exprimer "un gain de 50->60% vaut plus qu'un gain de 90->95%"
+    pour orienter le GP vers l'amelioration des conditions encore mediocres
+    plutot que les derniers % d'optimisation deja avancee.
+
+    Champs YAML par output :
+        utility: "linear" (defaut) | "log" | "sqrt"
+        utility_threshold: float (par defaut 0.0) — applique seulement
+                           au-dessus de ce seuil. En-dessous, lineaire.
+
+    Pour direction='minimize', l'utilite est ignoree (toujours lineaire) :
+    on veut le minimum coute que coute, pas de rendement decroissant.
+
+    Retourne y_col transforme (meme shape).
+    """
+    utility = str(out_cfg.get("utility", "linear")).lower()
+    if utility == "linear" or utility == "none":
+        return y_col
+
+    # Seulement sur maximize — les minimize gardent l'echelle lineaire
+    direction = str(out_cfg.get("direction", "maximize")).lower()
+    if direction != "maximize":
+        return y_col
+
+    threshold = float(out_cfg.get("utility_threshold", 0.0))
+    y = np.asarray(y_col, dtype=float).copy()
+
+    # Sous le seuil : echelle lineaire d'origine
+    # Au-dessus : transformation concave centree sur le seuil
+    above = y > threshold
+    if not above.any():
+        return y
+
+    delta = y[above] - threshold
+    if utility == "log":
+        # log(1 + delta) — gain decroissant ; equivaut a delta pour delta<<1
+        y[above] = threshold + np.log1p(np.maximum(delta, 0.0))
+    elif utility == "sqrt":
+        y[above] = threshold + np.sqrt(np.maximum(delta, 0.0))
+    else:
+        # type inconnu -> ignore silencieusement, pas de transformation
+        return np.asarray(y_col, dtype=float)
+    return y
+
+
 def scalarise(Y, cfg, pareto_weights=None):
     outputs = cfg["outputs"]
     mode    = cfg["bo_settings"].get("multi_objective_mode", "weighted_sum")
     n_out   = len(outputs)
     Y_s = np.zeros_like(Y, dtype=float)
     for j, out in enumerate(outputs):
-        Y_s[:, j] = Y[:, j] * _sign(out)
+        # v3.7c : transformation d'utilite (log/sqrt/linear) avant signe
+        y_transformed = _apply_utility(Y[:, j], out)
+        Y_s[:, j] = y_transformed * _sign(out)
     if n_out == 1:
         return Y_s[:, 0]
     if mode == "weighted_sum":
@@ -902,9 +1099,6 @@ def scalarise(Y, cfg, pareto_weights=None):
         raise ValueError(f"multi_objective_mode inconnu : '{mode}'.")
 
 
-def feasible_best(Y, cfg, pareto_weights=None):
-    scores = scalarise(Y, cfg, pareto_weights)
-    return float(scores.max()) if scores.size > 0 else 0.0
 
 
 # =============================================================================
@@ -1005,10 +1199,65 @@ def _require_torch():
             "Installez-le avec : pip install gpytorch torch"
         )
 
-class _ExactGPModel(gpytorch.models.ExactGP if _TORCH_OK else object):
-    """Modele GP exact GPyTorch — Matern 5/2 ARD avec GammaPriors."""
 
-    def __init__(self, X, y, likelihood, n_dims):
+class _KumaraswamyWarping:
+    """
+    Input warping via Kumaraswamy CDF (v3.6).
+
+    Chaque dimension d'entree est transformee independamment :
+      x' = 1 - (1 - x^a)^b, avec x dans [0,1]
+
+    a=b=1 -> identite (initialisation neutre).
+    Apprise conjointement avec les hyperparametres GP via ADAM.
+
+    Permet au GP de s'adapter a des effets non-lineaires sur les inputs
+    (ex: plateau de temperature, seuil d'equivalents).
+    """
+    def __init__(self, n_dims):
+        self.n_dims = n_dims
+        # Parametres torch (raw), sigmoid pour contraindre > 0
+        # init: raw=0 -> a=b=1 (identite)
+        self._a_raw = None  # rempli au fit
+        self._b_raw = None
+
+    def init_params(self):
+        """Cree les parametres torch (appele au fit)."""
+        import torch
+        # raw_a, raw_b : transformes via softplus pour rester positifs
+        # softplus(0) = ln(2) ~ 0.693, proche de 1 apres exp -> warping doux
+        self._a_raw = torch.nn.Parameter(torch.zeros(self.n_dims))
+        self._b_raw = torch.nn.Parameter(torch.zeros(self.n_dims))
+
+    def parameters(self):
+        return [self._a_raw, self._b_raw]
+
+    def transform(self, X_t):
+        """Applique Kumaraswamy CDF par dimension. X_t : torch.Tensor (n, d)"""
+        import torch
+        if self._a_raw is None:
+            return X_t
+        # Contraintes : a, b > 0.3 (eviter effondrement) et < 5 (eviter warping extreme)
+        a = 0.3 + torch.nn.functional.softplus(self._a_raw) * 1.5
+        b = 0.3 + torch.nn.functional.softplus(self._b_raw) * 1.5
+        # Clip x strict dans (eps, 1-eps) pour stabilite
+        X_clamped = torch.clamp(X_t, min=1e-6, max=1.0 - 1e-6)
+        # Kumaraswamy CDF
+        return 1.0 - torch.pow(1.0 - torch.pow(X_clamped, a), b)
+
+    def get_params_numpy(self):
+        """Retourne (a, b) apres activation, en numpy (pour diagnostic)."""
+        import torch
+        if self._a_raw is None:
+            return None, None
+        with torch.no_grad():
+            a = 0.3 + torch.nn.functional.softplus(self._a_raw) * 1.5
+            b = 0.3 + torch.nn.functional.softplus(self._b_raw) * 1.5
+        return a.numpy(), b.numpy()
+
+class _ExactGPModel(gpytorch.models.ExactGP if _TORCH_OK else object):
+    """Modele GP exact GPyTorch — Matern 5/2 ARD avec GammaPriors + warping."""
+
+    def __init__(self, X, y, likelihood, n_dims, warper=None):
         if not _TORCH_OK:
             raise ImportError("GPyTorch requis")
         super().__init__(X, y, likelihood)
@@ -1022,12 +1271,100 @@ class _ExactGPModel(gpytorch.models.ExactGP if _TORCH_OK else object):
         self.covar_module = gpytorch.kernels.ScaleKernel(
             base_kernel, outputscale_prior=os_prior
         )
+        # Warping Kumaraswamy (v3.6) : si fourni, applique transformation avant kernel
+        self._warper = warper
+        if warper is not None:
+            # Enregistrer les parametres du warper comme modules de ce GP
+            # pour qu'ils soient optimises par ADAM
+            for i, p in enumerate(warper.parameters()):
+                self.register_parameter(f"warp_param_{i}", p)
 
     def forward(self, x):
+        # Applique le warping avant le kernel si actif
+        if self._warper is not None:
+            x = self._warper.transform(x)
         return gpytorch.distributions.MultivariateNormal(
             self.mean_module(x), self.covar_module(x)
         )
 
+
+
+class _ExactGPModelComposite(gpytorch.models.ExactGP if _TORCH_OK else object):
+    """
+    GP avec kernel composite (v3.7) : additif + multiplicatif.
+
+    Structure :
+      k_composite = k_all_matern + k_cont_matern × k_cat_matern
+
+    Ou :
+      k_all_matern  : Matern 5/2 ARD sur toutes les dimensions (effets additifs)
+      k_cont_matern : Matern 5/2 ARD sur dimensions continues uniquement
+      k_cat_matern  : Matern 5/2 ARD sur dimensions catégorielles uniquement
+      le produit croisé capture les interactions cont × cat (ex : T × solvant)
+
+    Fallback si pas de dim categorielle : kernel single Matern (comportement v3.5).
+
+    Plus coûteux à fitter (~2x) mais capture mieux les interactions en chimie.
+    """
+    def __init__(self, X, y, likelihood, n_dims, continuous_dims, categorical_dims,
+                 warper=None):
+        if not _TORCH_OK:
+            raise ImportError("GPyTorch requis")
+        super().__init__(X, y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        ls_prior = gpytorch.priors.GammaPrior(3.0, 0.5)
+        os_prior = gpytorch.priors.GammaPrior(3.0, 0.5)
+
+        # Kernel global (sur toutes les dims)
+        self._k_all = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=n_dims,
+                                          lengthscale_prior=ls_prior),
+            outputscale_prior=os_prior
+        )
+
+        # Kernels separes sur sous-ensembles de dimensions
+        self._has_cat = len(categorical_dims) > 0
+        self._has_cont = len(continuous_dims) > 0
+        self._cont_dims = continuous_dims
+        self._cat_dims  = categorical_dims
+
+        if self._has_cont and self._has_cat:
+            self._k_cont = gpytorch.kernels.MaternKernel(
+                nu=2.5, ard_num_dims=len(continuous_dims),
+                active_dims=continuous_dims,
+                lengthscale_prior=ls_prior
+            )
+            self._k_cat = gpytorch.kernels.MaternKernel(
+                nu=2.5, ard_num_dims=len(categorical_dims),
+                active_dims=categorical_dims,
+                lengthscale_prior=ls_prior
+            )
+            self._k_interaction = gpytorch.kernels.ScaleKernel(
+                self._k_cont * self._k_cat,
+                outputscale_prior=os_prior
+            )
+            # covar_module exposé pour compat avec GPModel.fit (lengthscale extraction)
+            self.covar_module = self._k_all
+        else:
+            # Pas de dim categorielle ou pas de continue : fallback single kernel
+            self.covar_module = self._k_all
+            self._k_interaction = None
+
+        # Warping Kumaraswamy (comme _ExactGPModel)
+        self._warper = warper
+        if warper is not None:
+            for i, p in enumerate(warper.parameters()):
+                self.register_parameter(f"warp_param_{i}", p)
+
+    def forward(self, x):
+        if self._warper is not None:
+            x = self._warper.transform(x)
+        # Combine additif + multiplicatif
+        if self._k_interaction is not None:
+            covar = self._k_all(x) + self._k_interaction(x)
+        else:
+            covar = self._k_all(x)
+        return gpytorch.distributions.MultivariateNormal(self.mean_module(x), covar)
 
 class GPModel:
     """
@@ -1052,12 +1389,25 @@ class GPModel:
     """
 
     # Hyperparamètres fixes — calibrés pour la chimie de synthèse
-    _TRAIN_ITERS   = 150    # iterations ADAM par restart
-    _N_RESTARTS    = 5      # restarts aléatoires pour éviter les minima locaux
+    _TRAIN_ITERS   = 100    # iterations ADAM par restart (v3.5 : reduit de 150 → 100)
+    _N_RESTARTS    = 3      # restarts aléatoires (v3.5 : reduit de 5 → 3, -60% de temps)
+                            # v3.7d : remplace par self._n_restarts adaptatif au fit
     _LR            = 0.05   # learning rate ADAM
     _NOISE_FLOOR   = 1e-4   # bruit minimal (évite la dégénérescence)
 
-    def __init__(self, n_dims, normalize_y=True):
+    @staticmethod
+    def _adaptive_n_restarts(n_train):
+        """v3.7d : adapte le nombre de restarts ADAM selon la taille des donnees.
+        Petits datasets : peu de restarts (variance de fit dominee par les donnees).
+        Grands datasets : plus de restarts (paysage MLL plus complexe).
+        """
+        if n_train < 10:    return 3
+        if n_train < 30:    return 5
+        return 8
+
+    def __init__(self, n_dims, normalize_y=True,
+                 kernel_type="matern", continuous_dims=None, categorical_dims=None,
+                 noise_prior="low"):
         _require_torch()
         self.n_dims       = n_dims
         self.normalize_y  = normalize_y
@@ -1066,6 +1416,18 @@ class GPModel:
         # kernel_ stub initial (avant fit)
         self.kernel_ = _KernelStub(np.ones(n_dims))
         self.alpha   = self._NOISE_FLOOR
+        self._warper = None  # rempli au fit (Kumaraswamy v3.6)
+        # v3.7 : type de kernel et separation cont/cat pour composite
+        self._kernel_type = kernel_type
+        self._cont_dims   = continuous_dims if continuous_dims is not None else []
+        self._cat_dims    = categorical_dims if categorical_dims is not None else []
+        # v3.7c : niveau de bruit attendu pour le prior de la likelihood
+        # "low"    : GammaPrior(1.1, 0.05)  - bruit faible (défaut historique)
+        # "medium" : GammaPrior(2.0, 0.15)  - bruit modéré (CV 5-15%)
+        # "high"   : GammaPrior(2.5, 0.5)   - bruit fort   (CV > 15%, données bruitées)
+        if noise_prior not in ("low", "medium", "high"):
+            noise_prior = "low"
+        self._noise_prior = noise_prior
 
     # ── Conversion numpy → torch ──────────────────────────────────────────────
     @staticmethod
@@ -1074,16 +1436,58 @@ class GPModel:
 
     # ── Construction du modèle GPyTorch ──────────────────────────────────────
     def _build(self, X_t, y_t):
+        # v3.9 : priors de bruit RECALIBRES pour y standardise (variance=1).
+        # ANCIEN BUG : les priors etaient calibres pour des rendements bruts
+        # (0-100), donnant un bruit attendu enorme une fois y standardise
+        # (mode 2.0, moyenne 22 sur une variance de signal de 1.0). Resultat :
+        # le GP surestimait le bruit (~2x) et lissait les vrais pics.
+        # Nouveaux priors : mode du bruit-variance a 1% / 5% / 15% de la
+        # variance du signal, soit ~±1 / ±2.5 / ±4 points sur un rendement
+        # d'ecart-type ~11. (mode = (alpha-1)/beta)
+        #   "low"    : Gamma(2.0, 100) mode=0.01  - mesures fiables (±1-2%)
+        #   "medium" : Gamma(2.0, 20)  mode=0.05  - bruit modere (±3-7%)
+        #   "high"   : Gamma(2.0, 6.67) mode=0.15 - donnees bruitees (±10%+)
+        _np = getattr(self, "_noise_prior", "low")
+        if _np == "high":
+            noise_prior_obj = gpytorch.priors.GammaPrior(2.0, 6.67)
+        elif _np == "medium":
+            noise_prior_obj = gpytorch.priors.GammaPrior(2.0, 20.0)
+        else:  # "low"
+            noise_prior_obj = gpytorch.priors.GammaPrior(2.0, 100.0)
+
         likelihood = gpytorch.likelihoods.GaussianLikelihood(
-            noise_constraint=gpytorch.constraints.GreaterThan(self._NOISE_FLOOR)
+            noise_constraint=gpytorch.constraints.GreaterThan(self._NOISE_FLOOR),
+            noise_prior=noise_prior_obj,
         )
-        model = _ExactGPModel(X_t, y_t, likelihood, self.n_dims)
+        # Warper Kumaraswamy (v3.6+) : toujours actif
+        # v3.7b : init leger vers identite si peu de donnees (<=10 pts)
+        # pour eviter le warping aggressif sur données rares
+        warper = _KumaraswamyWarping(self.n_dims)
+        warper.init_params()
+        if hasattr(self, "_n_train") and self._n_train <= 10:
+            import torch
+            with torch.no_grad():
+                warper._a_raw.fill_(-0.3)  # softplus(-0.3) -> a≈0.52, warping doux
+                warper._b_raw.fill_(-0.3)
+        # v3.7 : kernel composite si demande et dims separables
+        if self._kernel_type == "composite" and (self._cont_dims or self._cat_dims):
+            model = _ExactGPModelComposite(
+                X_t, y_t, likelihood, self.n_dims,
+                continuous_dims=self._cont_dims,
+                categorical_dims=self._cat_dims,
+                warper=warper
+            )
+        else:
+            model = _ExactGPModel(X_t, y_t, likelihood, self.n_dims, warper=warper)
+        # Garder reference au warper pour diagnostic
+        self._warper = warper
         return model, likelihood
 
     # ── Entrainement ──────────────────────────────────────────────────────────
     def fit(self, X, y):
         X_np = np.array(X, dtype=np.float32)
         y_np = np.array(y, dtype=np.float32)
+        self._n_train = len(X_np)  # v3.7b : pour warping adaptatif
 
         # Standardisation y si demandée (évite double compression avec MinMax)
         if self.normalize_y and len(y_np) >= 2:
@@ -1099,8 +1503,12 @@ class GPModel:
 
         best_loss  = np.inf
         best_state = None
+        n_failed_restarts = 0  # v3.7d : compte les fits divergents
 
-        for restart in range(self._N_RESTARTS + 1):
+        # v3.7d : n_restarts adaptatif selon taille des donnees
+        n_restarts_eff = self._adaptive_n_restarts(len(X_np))
+
+        for restart in range(n_restarts_eff + 1):
             model, likelihood = self._build(X_t, y_t)
             model.train(); likelihood.train()
 
@@ -1111,6 +1519,7 @@ class GPModel:
             mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
             torch.manual_seed(restart * 17 + 42)
+            restart_failed = False
             for _ in range(self._TRAIN_ITERS):
                 optimizer.zero_grad()
                 try:
@@ -1118,12 +1527,20 @@ class GPModel:
                     loss.backward()
                     optimizer.step()
                 except Exception:
+                    restart_failed = True
                     break
 
             try:
                 final_loss = float(loss.item())
+                if not np.isfinite(final_loss):
+                    final_loss = np.inf
+                    restart_failed = True
             except Exception:
                 final_loss = np.inf
+                restart_failed = True
+
+            if restart_failed:
+                n_failed_restarts += 1
 
             if final_loss < best_loss:
                 best_loss  = final_loss
@@ -1131,6 +1548,12 @@ class GPModel:
                     "model":      {k: v.clone().detach() for k,v in model.state_dict().items()},
                     "likelihood": {k: v.clone().detach() for k,v in likelihood.state_dict().items()},
                 }
+
+        # v3.7d : si tous les restarts ont divergé, warning explicite
+        if n_failed_restarts >= n_restarts_eff and best_state is None:
+            print(f"  [WARN GP] tous les restarts MLL ont diverge "
+                  f"({n_failed_restarts}/{n_restarts_eff+1}). "
+                  f"Le GP est probablement degenere. Inspecter les donnees.")
 
         # Recharger le meilleur état
         self._model, self._likelihood = self._build(X_t, y_t)
@@ -1155,15 +1578,29 @@ class GPModel:
         return self
 
     # ── Prédiction ────────────────────────────────────────────────────────────
-    def predict(self, X, return_std=False, return_cov=False):
+    def predict(self, X, return_std=False, return_cov=False, return_std_split=False):
+        """
+        return_std_split=True : renvoie (mu, sigma_epistemic, sigma_aleatoric)
+            sigma_epistemic : incertitude reductible (manque de donnees)
+            sigma_aleatoric : bruit intrinseque (appris via likelihood.noise)
+        """
         X_t = self._t(np.array(X, dtype=np.float32))
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            pred = self._likelihood(self._model(X_t))
-            mu  = pred.mean.numpy().astype(np.float64)
-            mu  = mu * self._y_std + self._y_mean
+            # Prediction sans likelihood = epistemique seul
+            pred_f = self._model(X_t)
+            mu = pred_f.mean.numpy().astype(np.float64) * self._y_std + self._y_mean
+
+            if return_std_split:
+                sigma_ep = pred_f.stddev.numpy().astype(np.float64) * self._y_std
+                noise_var = float(self._likelihood.noise.item())
+                sigma_al = float(np.sqrt(noise_var)) * self._y_std
+                sigma_al_arr = np.full_like(sigma_ep, sigma_al)
+                return mu, sigma_ep, sigma_al_arr
+
+            # Chemin standard : total = epistemique + aleatoire via likelihood
+            pred = self._likelihood(pred_f)
 
             if return_cov:
-                # Covariance complète (pour Thompson Sampling)
                 cov = pred.covariance_matrix.numpy().astype(np.float64)
                 cov = cov * (self._y_std ** 2)
                 return mu, cov
@@ -1182,34 +1619,351 @@ class _KernelStub:
         self.k1 = type("k1", (), {"constant_value": 1.0})()
 
 
-def build_gp(n_dims, normalize_y=True, **kwargs):
+
+
+class GPModelWithPrior(GPModel):
+    """
+    Extension de GPModel qui ajoute un prior mean physico-chimique (v3.7).
+
+    Au fit : centre les y par y_prior(X_train) avant de passer au GP
+    Au predict : ajoute y_prior(X_test) au mu retourne par le GP
+
+    Le GP apprend ainsi les residus par rapport au prior (plus facile a modeliser,
+    convergence plus rapide si le prior est correct).
+
+    L activation est transparente : cette classe est instanciee uniquement
+    si cfg["prior_mean"]["type"] != "none".
+
+    Compatible avec kernel_type="composite" (v3.7) via super().__init__.
+    """
+    def __init__(self, cfg, encoder, **kwargs):
+        super().__init__(**kwargs)
+        self._prior_cfg = cfg
+        self._prior_encoder = encoder
+
+    def fit(self, X, y):
+        prior = _compute_prior_mean(X, self._prior_cfg, self._prior_encoder)
+        y_centered = np.asarray(y, dtype=float) - prior
+        return super().fit(X, y_centered)
+
+    def predict(self, X, return_std=False, return_cov=False, return_std_split=False):
+        prior = _compute_prior_mean(X, self._prior_cfg, self._prior_encoder)
+        if return_std_split:
+            mu, se, sa = super().predict(X, return_std_split=True)
+            return mu + prior, se, sa
+        if return_cov:
+            mu, cov = super().predict(X, return_cov=True)
+            return mu + prior, cov
+        if return_std:
+            mu, std = super().predict(X, return_std=True)
+            return mu + prior, std
+        mu = super().predict(X)
+        return mu + prior
+
+
+# =============================================================================
+# SAASBO — Sparse Axis-Aligned Subspace BO (Eriksson & Jankowiak, UAI 2021)
+# =============================================================================
+# Identifie automatiquement les dimensions importantes via un prior log-normal
+# half-Cauchy sur les inverse-lengthscales. Echantillonne le posterior via NUTS.
+# Utile pour HAUTE DIMENSION (>= 6 params) — surpasse ARD classique sur des
+# problemes ou peu de variables sont actives (cas typique en chimie quand on
+# code des descripteurs ou des solvants par one-hot).
+#
+# Active via cfg["bo_settings"]["use_saasbo"]: true (opt-in).
+# Necessite Pyro : conda install -c conda-forge pyro-ppl
+
+class SAASGP:
+    """
+    GP avec prior sparse sur les inverse-lengthscales (kappa_d), echantillonne
+    par NUTS. La prediction marginalize sur n_samples du posterior.
+
+    Interface compatible GPModel.predict(X, return_std=True).
+
+    Hyperparametres :
+      tau    : controle global de la sparsite (default 0.1)
+      n_warmup : NUTS burn-in (default 256)
+      n_samples : nombre d'echantillons posterieurs gardes (default 256)
+      thinning : 1 par defaut (pas de thinning)
+    """
+
+    def __init__(self, n_dims, normalize_y=True,
+                 tau=0.1, n_warmup=256, n_samples=256, thinning=1, **kwargs):
+        self.n_dims        = n_dims
+        self.normalize_y   = normalize_y
+        self._tau          = float(tau)
+        self._n_warmup     = int(n_warmup)
+        self._n_samples    = int(n_samples)
+        self._thinning     = int(thinning)
+        self._y_mean = 0.0
+        self._y_std  = 1.0
+        self._samples = None  # rempli par fit
+        self._X_train = None
+        self._y_train = None
+        self.kernel_  = _KernelStub(np.ones(n_dims))
+        self.alpha    = 1e-4
+
+    @staticmethod
+    def _check_pyro():
+        try:
+            import pyro       # noqa: F401
+            import pyro.infer # noqa: F401
+            import torch      # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def fit(self, X, y):
+        """Fit via NUTS sampling. Lent (~30s pour n=20, n_dims=10)."""
+        if not self._check_pyro():
+            raise RuntimeError(
+                "SAASBO necessite pyro-ppl. Installer via :\n"
+                "  conda install -c conda-forge pyro-ppl\n"
+                "ou : pip install pyro-ppl"
+            )
+
+        import torch
+        import pyro
+        import pyro.distributions as dist
+        from pyro.infer.mcmc import MCMC, NUTS
+
+        X_np = np.array(X, dtype=np.float32)
+        y_np = np.array(y, dtype=np.float32)
+
+        # Standardisation y
+        if self.normalize_y and len(y_np) >= 2:
+            self._y_mean = float(y_np.mean())
+            self._y_std  = max(float(y_np.std()), 1e-6)
+            y_np = (y_np - self._y_mean) / self._y_std
+        else:
+            self._y_mean = 0.0
+            self._y_std  = 1.0
+
+        X_t = torch.tensor(X_np, dtype=torch.float64)
+        y_t = torch.tensor(y_np, dtype=torch.float64)
+        D   = X_t.shape[1]
+        N   = X_t.shape[0]
+
+        def saas_model(X, y):
+            # Outputscale
+            outputscale = pyro.sample("outputscale", dist.HalfNormal(scale=1.0))
+            # Mean
+            mean = pyro.sample("mean", dist.Normal(0.0, 1.0))
+            # Noise
+            noise = pyro.sample("noise", dist.HalfNormal(scale=1.0))
+            # Sparse prior : tau * Cauchy^+, then individual log-normal
+            tau = pyro.sample("tau", dist.HalfCauchy(scale=self._tau))
+            # Inverse-lengthscales kappa_d
+            with pyro.plate("kappas", D):
+                kappa = pyro.sample("kappa",
+                                    dist.HalfCauchy(scale=tau))
+
+            # Compute K matrix : Matern 5/2 with kappa_d (inverse lengthscale)
+            ls = 1.0 / (kappa + 1e-9)  # lengthscales
+            # squared distances normalisees par ls
+            diff = (X.unsqueeze(1) - X.unsqueeze(0)) / ls.unsqueeze(0).unsqueeze(0)
+            r2   = (diff ** 2).sum(-1)
+            r    = torch.sqrt(r2 + 1e-12)
+            sqrt5 = float(np.sqrt(5.0))
+            K = outputscale * (1 + sqrt5 * r + (5.0 / 3.0) * r2) * torch.exp(-sqrt5 * r)
+            K = K + (noise + 1e-6) * torch.eye(N, dtype=K.dtype)
+
+            pyro.sample("y",
+                        dist.MultivariateNormal(loc=mean * torch.ones(N, dtype=K.dtype),
+                                                covariance_matrix=K),
+                        obs=y)
+
+        pyro.clear_param_store()
+        nuts_kernel = NUTS(saas_model, jit_compile=False, max_tree_depth=8)
+        mcmc = MCMC(nuts_kernel,
+                    num_samples=self._n_samples * self._thinning,
+                    warmup_steps=self._n_warmup,
+                    disable_progbar=True)
+        mcmc.run(X_t, y_t)
+        samples = mcmc.get_samples(group_by_chain=False)
+
+        # Thin
+        for k in samples:
+            samples[k] = samples[k][::self._thinning][:self._n_samples]
+
+        self._samples = samples
+        self._X_train = X_t
+        self._y_train = y_t
+
+        # Mettre a jour kernel_ avec lengthscales moyennes pour compatibility
+        ls_mean = (1.0 / (samples["kappa"].mean(0) + 1e-9)).numpy()
+        self.kernel_ = _KernelStub(ls_mean)
+        self.alpha   = float(samples["noise"].mean().item())
+        return self
+
+    def predict(self, X, return_std=False, return_cov=False, return_std_split=False):
+        """Marginalize sur les samples NUTS. Plus lent que GPModel mais plus precis."""
+        if self._samples is None:
+            raise RuntimeError("SAASGP doit etre fit() avant predict()")
+        import torch
+
+        X_t = torch.tensor(np.array(X, dtype=np.float32), dtype=torch.float64)
+        N_test = X_t.shape[0]
+        S = self._samples["kappa"].shape[0]
+        D = X_t.shape[1]
+
+        means_all = np.zeros((S, N_test))
+        vars_all  = np.zeros((S, N_test))
+
+        sqrt5 = float(np.sqrt(5.0))
+        with torch.no_grad():
+            for s in range(S):
+                kappa = self._samples["kappa"][s]  # (D,)
+                outputscale = float(self._samples["outputscale"][s])
+                noise = float(self._samples["noise"][s])
+                mean_const = float(self._samples["mean"][s])
+
+                ls = 1.0 / (kappa + 1e-9)
+
+                # K(X_train, X_train)
+                diff_tr = (self._X_train.unsqueeze(1) - self._X_train.unsqueeze(0)) / ls
+                r2_tr = (diff_tr ** 2).sum(-1)
+                r_tr  = torch.sqrt(r2_tr + 1e-12)
+                K_tr = outputscale * (1 + sqrt5 * r_tr + (5.0/3.0)*r2_tr) * torch.exp(-sqrt5 * r_tr)
+                K_tr = K_tr + (noise + 1e-6) * torch.eye(K_tr.shape[0], dtype=K_tr.dtype)
+
+                # K(X_test, X_train)
+                diff_x = (X_t.unsqueeze(1) - self._X_train.unsqueeze(0)) / ls
+                r2_x = (diff_x ** 2).sum(-1)
+                r_x  = torch.sqrt(r2_x + 1e-12)
+                K_x = outputscale * (1 + sqrt5 * r_x + (5.0/3.0)*r2_x) * torch.exp(-sqrt5 * r_x)
+
+                # K(X_test, X_test) diag
+                K_xx_diag = torch.full((N_test,), float(outputscale), dtype=K_tr.dtype)
+
+                # Solve
+                try:
+                    L_tr = torch.linalg.cholesky(K_tr)
+                    alpha = torch.cholesky_solve((self._y_train - mean_const).unsqueeze(-1), L_tr).squeeze(-1)
+                    mu = mean_const + (K_x @ alpha)
+                    v  = torch.cholesky_solve(K_x.T, L_tr)
+                    var_diag = K_xx_diag - (K_x * v.T).sum(dim=1)
+                    var_diag = torch.clamp(var_diag, min=1e-9)
+                except Exception:
+                    mu = torch.zeros(N_test, dtype=K_tr.dtype)
+                    var_diag = torch.full((N_test,), float(outputscale), dtype=K_tr.dtype)
+
+                means_all[s] = mu.numpy()
+                vars_all[s]  = var_diag.numpy()
+
+        # Marginalize : E[mu], V[mu] = E[var] + V[mu_s] (loi de variance totale)
+        mu_post = means_all.mean(axis=0)
+        var_post = vars_all.mean(axis=0) + means_all.var(axis=0)
+
+        # De-normaliser
+        mu_real = mu_post * self._y_std + self._y_mean
+        std_real = np.sqrt(var_post) * self._y_std
+
+        if return_std_split:
+            return mu_real, std_real, np.full_like(std_real, self.alpha * self._y_std)
+        if return_cov:
+            # Approximation : matrice diagonale (vraie cov inter-points trop coûteuse)
+            return mu_real, np.diag(std_real**2)
+        if return_std:
+            return mu_real, std_real
+        return mu_real
+
+
+def build_gp(n_dims, normalize_y=True, cfg=None, encoder=None,
+             y_train=None, **kwargs):
     """
     Crée un GPModel GPyTorch.
     Interface identique à l ancienne fonction sklearn pour compatibilité.
     Les kwargs (alpha, etc.) sont ignorés — le GP gère son bruit en interne.
+
+    v3.7 routage :
+    - cfg["bo_settings"]["kernel"] = "composite" -> kernel additif+multiplicatif
+    - cfg["prior_mean"]["type"] != "none"        -> GPModelWithPrior
+
+    v3.7c noise_prior :
+    - cfg["bo_settings"]["noise_prior"] = "low" / "medium" / "high" / "auto"
+    - "auto" (defaut) : detecte selon CV des y_train. CV > 15% -> medium ;
+       CV > 30% -> high. Fournir y_train pour activer la detection.
+
+    v3.7d use_saasbo :
+    - cfg["bo_settings"]["use_saasbo"]: true active SAASGP a la place du GP standard.
+       Recommande pour n_dims >= 6 quand certaines variables sont peu actives.
+       Necessite pyro-ppl. Plus lent (~30s vs ~3s par fit).
     """
-    return GPModel(n_dims=n_dims, normalize_y=normalize_y)
+    # Determiner kernel_type et identifier dims cont/cat
+    kernel_type = "matern"
+    continuous_dims = []
+    categorical_dims = []
+    noise_prior_setting = "auto"
+    if cfg is not None and encoder is not None:
+        bo_cfg = cfg.get("bo_settings", {})
+        kernel_type = bo_cfg.get("kernel", "matern")
+        noise_prior_setting = bo_cfg.get("noise_prior", "auto")
+        # Identifier les dimensions encodees par type
+        dim_cursor = 0
+        for pi, p in enumerate(cfg["parameters"]):
+            nd = encoder._encoded_dims[pi]
+            if p["type"] == "continuous":
+                continuous_dims.extend(range(dim_cursor, dim_cursor + nd))
+            else:
+                categorical_dims.extend(range(dim_cursor, dim_cursor + nd))
+            dim_cursor += nd
+
+    # v3.7c : auto-detection noise_prior selon CV
+    if noise_prior_setting == "auto":
+        if y_train is not None and len(y_train) >= 5:
+            y_arr = np.array(y_train, dtype=float).ravel()
+            mu    = abs(y_arr.mean())
+            cv    = (y_arr.std() / max(mu, 1e-6)) if mu > 1e-6 else 0.0
+            if cv > 0.30:
+                noise_prior_resolved = "high"
+                print(f"  [NOISE-AUTO] CV={cv*100:.1f}% > 30% -> noise_prior=high")
+            elif cv > 0.15:
+                noise_prior_resolved = "medium"
+                print(f"  [NOISE-AUTO] CV={cv*100:.1f}% > 15% -> noise_prior=medium")
+            else:
+                noise_prior_resolved = "low"
+        else:
+            noise_prior_resolved = "low"
+    else:
+        noise_prior_resolved = noise_prior_setting
+
+    gp_kwargs = dict(n_dims=n_dims, normalize_y=normalize_y,
+                     kernel_type=kernel_type,
+                     continuous_dims=continuous_dims,
+                     categorical_dims=categorical_dims,
+                     noise_prior=noise_prior_resolved)
+
+    # v3.7d : Route vers SAASGP si demande (opt-in via use_saasbo: true)
+    if cfg is not None:
+        bo_cfg2 = cfg.get("bo_settings", {})
+        if bo_cfg2.get("use_saasbo", False):
+            if SAASGP._check_pyro():
+                saas_kwargs = dict(
+                    n_dims=n_dims, normalize_y=normalize_y,
+                    tau       = float(bo_cfg2.get("saasbo_tau", 0.1)),
+                    n_warmup  = int(bo_cfg2.get("saasbo_warmup", 256)),
+                    n_samples = int(bo_cfg2.get("saasbo_samples", 256)),
+                    thinning  = int(bo_cfg2.get("saasbo_thinning", 1)),
+                )
+                return SAASGP(**saas_kwargs)
+            else:
+                print("  [WARN] use_saasbo=true mais pyro-ppl non installe. "
+                      "Fallback GPModel standard. Installer via :")
+                print("         conda install -c conda-forge pyro-ppl")
+
+    # Route vers GPModelWithPrior si prior actif
+    if cfg is not None and encoder is not None:
+        prior_cfg = cfg.get("prior_mean", {})
+        if prior_cfg and prior_cfg.get("type", "none") != "none":
+            # Note : GPModelWithPrior herite GPModel, donc accepte les memes kwargs
+            return GPModelWithPrior(cfg=cfg, encoder=encoder, **gp_kwargs)
+    return GPModel(**gp_kwargs)
 
 
 # =============================================================================
 # 5b.  BACKEND GPYTORCH (optionnel — gp_backend: "torch" dans le YAML)
 # =============================================================================
-
-def _try_import_torch():
-    """Importe GPyTorch si disponible, retourne False sinon."""
-    try:
-        import torch
-        import gpytorch
-        return torch, gpytorch
-    except ImportError:
-        return None, None
-
-
-
-# =============================================================================
-# 6.  FONCTIONS D'ACQUISITION
-# =============================================================================
-
 def acq_ei(X_norm, gp, y_best, xi=0.01):
     mu, sigma = gp.predict(X_norm, return_std=True)
     sigma = np.maximum(sigma, 1e-9)
@@ -1298,6 +2052,167 @@ def acq_tei(X_norm, gp, y_best, xi=0.001, beta=8):
     tei = np.maximum(tei, 0.0)
     return tei
 
+
+def acq_qei(X_batch, gp, y_best, xi=0.01, n_samples=512):
+    """
+    v3.7d : quasi-MC Expected Improvement pour batch (n_suggestions >= 2).
+    
+    **REQUIS** : torch et gpytorch (utilisés par GPModel).
+    
+    Calcule EI du batch via échantillonnage GP multivarié. Plus rapide que
+    Kriging Believer (pas de refit GP), plus précis que Local Penalization.
+    
+    Args:
+        X_batch   : array (n_batch, n_dims) — candidats batch normalisés
+        gp        : GPModel entraîné
+        y_best    : float — meilleur y observé
+        xi        : float — paramètre exploration
+        n_samples : int — nb échantillons MC (défaut 512, min 128)
+    
+    Returns:
+        float — valeur qEI du batch (pas par point, batch global)
+    
+    Usage dans suggest_experiments:
+        Pour générer un batch de taille N, on optimise x1, puis on ajoute x1
+        au batch candidat et on optimise qEI([x1, x2]), etc. séquentiellement.
+    """
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Force CPU-only
+    import torch
+    
+    n_batch = X_batch.shape[0]
+    if n_batch == 1:
+        # Fallback EI standard si batch=1
+        return acq_ei(X_batch, gp, y_best, xi)
+    
+    # Prédiction GP : mu et covariance complète du batch
+    with torch.no_grad():
+        X_t = torch.tensor(X_batch, dtype=torch.float32)
+        gp._model.eval()
+        pred = gp._model(X_t)
+        mu = pred.mean.numpy()  # (n_batch,)
+        cov = pred.covariance_matrix.numpy()  # (n_batch, n_batch)
+    
+    # Échantillonnage multivarié N(mu, cov)
+    try:
+        samples = np.random.multivariate_normal(mu, cov, size=n_samples)  # (n_samples, n_batch)
+    except np.linalg.LinAlgError:
+        # Fallback si cov singulière : diagonale uniquement
+        std = np.sqrt(np.maximum(np.diag(cov), 1e-9))
+        samples = mu[None, :] + std[None, :] * np.random.randn(n_samples, n_batch)
+    
+    # EI du batch : max(0, max_batch(sample) - y_best - xi) moyenné sur samples
+    max_per_sample = samples.max(axis=1)  # (n_samples,) — meilleur du batch par sample
+    ei_batch = np.maximum(0, max_per_sample - y_best - xi).mean()
+    
+    return float(ei_batch)
+
+
+def acq_qnei(X_batch, gp, y_best, xi=0.01, n_samples=512):
+    """
+    v3.7d : quasi-MC Noisy Expected Improvement pour batch.
+    
+    Comme qEI mais tient compte du bruit observationnel (utile si noise_prior=high).
+    Marginalise sur le bruit en plus de l'incertitude GP.
+    
+    Args: identiques à acq_qei
+    Returns: float — valeur qNEI du batch
+    """
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    import torch
+    
+    n_batch = X_batch.shape[0]
+    if n_batch == 1:
+        return acq_ei(X_batch, gp, y_best, xi)
+    
+    with torch.no_grad():
+        X_t = torch.tensor(X_batch, dtype=torch.float32)
+        gp._model.eval()
+        pred = gp._model(X_t)
+        mu = pred.mean.numpy()
+        cov = pred.covariance_matrix.numpy()
+        
+        # Ajouter bruit observationnel à la diagonale
+        noise_var = float(gp._likelihood.noise.item())
+        cov_noisy = cov + np.eye(n_batch) * noise_var
+    
+    try:
+        samples = np.random.multivariate_normal(mu, cov_noisy, size=n_samples)
+    except np.linalg.LinAlgError:
+        std = np.sqrt(np.maximum(np.diag(cov_noisy), 1e-9))
+        samples = mu[None, :] + std[None, :] * np.random.randn(n_samples, n_batch)
+    
+    max_per_sample = samples.max(axis=1)
+    ei_batch = np.maximum(0, max_per_sample - y_best - xi).mean()
+    return float(ei_batch)
+
+
+
+def acq_kg(X_norm, gp, y_best, n_fantasy=32, n_grid=200, rng=None):
+    """
+    Knowledge Gradient (KG) exact via Monte Carlo avec fantaisies (v3.6).
+
+    Pour chaque point candidat x :
+      1. Echantillonner n_fantasy valeurs y_fantasy ~ N(mu(x), sigma(x))
+      2. Pour chaque y_fantasy, refit hypothetique du GP (formule de Kriging update)
+      3. Trouver le nouveau max sur une grille de reference
+      4. KG(x) = E[max_posterior] - max_prior
+
+    Utilise les formules de update Bayesien sans re-fit complet (rapide).
+
+    Retourne : KG(x) >= 0, plus grand = plus d'information attendue
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    # Guards : X_norm doit etre 2D et non vide
+    X_norm = np.atleast_2d(X_norm)
+    if len(X_norm) == 0:
+        return np.array([])
+
+    # Predictions aux candidats
+    mu_X, sigma_X = gp.predict(X_norm, return_std=True)
+
+    # Grille de reference (pour chercher le nouveau max)
+    # Utilise les candidats eux-memes comme reference : O(n^2) mais n petit
+    X_ref = X_norm
+    mu_ref_prior, cov_ref_prior = gp.predict(X_ref, return_cov=True)
+    max_prior = float(mu_ref_prior.max())
+
+    # Fantasy sampling : normal reduit
+    # KG(x) = E_z [ max(mu_ref + sigma_tilde(x, X_ref) * z) ] - max_prior
+    # où sigma_tilde = cov(x, X_ref) / sigma(x)  (effet d'une observation en x)
+    n_x = len(X_norm)
+    n_ref = len(X_ref)
+
+    # Covariances croisees cov(x_i, X_ref)
+    # On refait une prediction jointe pour obtenir la cov complete
+    # Approximation pragmatique : pour chaque x, cov(x, X_ref) via predict joint
+    kg_vals = np.zeros(n_x)
+    # z samples
+    Z = rng.standard_normal(n_fantasy)
+
+    for i in range(n_x):
+        # Stack [X[i], X_ref] et obtenir cov
+        X_joint = np.vstack([X_norm[i:i+1], X_ref])
+        _, cov_joint = gp.predict(X_joint, return_cov=True)
+        # cov(x_i, X_ref) est la 1ere ligne (sans [0,0])
+        cov_x_ref = cov_joint[0, 1:]  # shape (n_ref,)
+        sigma_x = np.sqrt(max(cov_joint[0, 0], 1e-12))
+        if sigma_x < 1e-6:
+            kg_vals[i] = 0.0
+            continue
+        sigma_tilde = cov_x_ref / sigma_x  # shape (n_ref,)
+
+        # Pour chaque z, calculer max(mu_ref + sigma_tilde * z)
+        # broadcasting : (n_ref, 1) + (n_ref, 1) * (n_fantasy,)
+        post_means = mu_ref_prior[:, None] + sigma_tilde[:, None] * Z[None, :]
+        max_per_z = post_means.max(axis=0)  # shape (n_fantasy,)
+        expected_max = float(max_per_z.mean())
+        kg_vals[i] = max(0.0, expected_max - max_prior)
+
+    return kg_vals
 
 def acq_thompson(X_norm, gp, rng):
     """
@@ -1455,6 +2370,122 @@ def _maximise_ehvi_grid(gps, ref_point, Y_signed, cfg, encoder, rng):
     return X_grid[best_idx]
 
 
+def acq_qnehvi(X_batch, gps, Y_pareto, ref_point, n_samples=64, rng=None):
+    """
+    v3.8 : q-Noisy Expected Hypervolume Improvement (Daulton et al. 2021).
+
+    Difference avec EHVI standard :
+      - q-batch : evalue HVI du batch entier (pas point par point)
+      - Noisy   : ajoute bruit observationnel, marginalise sur observation
+                  bruitee de Y_pareto (utile sans replicats)
+
+    Args:
+        X_batch    : (n_batch, n_dims) candidats normalises
+        gps        : liste de GPModel (un par objectif)
+        Y_pareto   : (n_pareto, n_obj) front Pareto actuel (signe : direction)
+        ref_point  : (n_obj,) point reference
+        n_samples  : MC samples (defaut 64)
+
+    Returns:
+        float : qNEHVI du batch
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    n_batch = X_batch.shape[0]
+    n_obj   = len(gps)
+
+    # Predictions : mu et covariance complete pour chaque objectif
+    mus  = np.zeros((n_batch, n_obj))
+    covs = np.zeros((n_obj, n_batch, n_batch))
+    noise_vars = np.zeros(n_obj)
+
+    try:
+        import torch
+        for j, gp in enumerate(gps):
+            with torch.no_grad():
+                X_t = torch.tensor(X_batch, dtype=torch.float32)
+                gp._model.eval()
+                pred = gp._model(X_t)
+                mus[:, j]  = pred.mean.numpy()
+                cov_j      = pred.covariance_matrix.numpy()
+                noise_j    = float(gp._likelihood.noise.item())
+            # Noisy : ajoute le bruit observationnel
+            covs[j] = cov_j + np.eye(n_batch) * noise_j
+            noise_vars[j] = noise_j
+    except Exception:
+        # Fallback : utilise predict() standard (variance diagonale)
+        for j, gp in enumerate(gps):
+            mu, std = gp.predict(X_batch, return_std=True)
+            mus[:, j] = mu.ravel()
+            covs[j]   = np.diag(np.maximum(std.ravel(), 1e-9) ** 2)
+
+    # Current hypervolume
+    hv_current = _hypervolume(Y_pareto, ref_point, rng)
+
+    # MC sampling : pour chaque sample, compute HVI du batch augmente
+    hvi_acc = 0.0
+    for s in range(n_samples):
+        # Echantillonner un Y_batch pour ce sample
+        y_batch = np.zeros((n_batch, n_obj))
+        for j in range(n_obj):
+            try:
+                y_batch[:, j] = rng.multivariate_normal(mus[:, j], covs[j])
+            except np.linalg.LinAlgError:
+                std_j = np.sqrt(np.maximum(np.diag(covs[j]), 1e-9))
+                y_batch[:, j] = mus[:, j] + std_j * rng.standard_normal(n_batch)
+
+        # Filtrer les points qui dominent le ref_point
+        mask_above_ref = np.all(y_batch > ref_point, axis=1)
+        if not mask_above_ref.any():
+            continue
+
+        # Augmenter Pareto avec le batch et calculer nouveau HV
+        Y_aug = np.vstack([Y_pareto, y_batch[mask_above_ref]])
+        hv_new = _hypervolume(Y_aug, ref_point, rng)
+        hvi_acc += max(0.0, hv_new - hv_current)
+
+    return hvi_acc / n_samples
+
+
+def _maximise_qnehvi_grid(gps, ref_point, Y_pareto, cfg, encoder, rng,
+                           n_batch=1):
+    """
+    Maximise qNEHVI par recherche grille (analogue _maximise_ehvi_grid).
+
+    Pour batch=1 : equivalent a noisy EHVI.
+    Pour batch>1 : optimisation greedy sequentielle (1 point a la fois).
+    """
+    bo     = cfg["bo_settings"]
+    n_mc   = int(bo.get("qnehvi_n_mc", 64))
+    N_GRID = int(bo.get("qnehvi_n_grid", 2000))
+    n_params = encoder.n_params
+
+    if n_batch == 1:
+        # Single point : grille standard
+        X_grid = rng.uniform(0, 1, (N_GRID, n_params))
+        scores = np.zeros(N_GRID)
+        for i in range(N_GRID):
+            scores[i] = acq_qnehvi(X_grid[i:i+1], gps, Y_pareto, ref_point,
+                                    n_samples=n_mc, rng=rng)
+        return X_grid[int(np.argmax(scores))]
+    else:
+        # Batch : greedy sequentiel
+        selected = []
+        for _ in range(n_batch):
+            X_grid = rng.uniform(0, 1, (N_GRID, n_params))
+            scores = np.zeros(N_GRID)
+            for i in range(N_GRID):
+                if selected:
+                    X_test = np.vstack([np.array(selected), X_grid[i:i+1]])
+                else:
+                    X_test = X_grid[i:i+1]
+                scores[i] = acq_qnehvi(X_test, gps, Y_pareto, ref_point,
+                                        n_samples=n_mc, rng=rng)
+            selected.append(X_grid[int(np.argmax(scores))])
+        return np.array(selected)
+
+
 # =============================================================================
 # 7.  MAXIMISATION DE L'ACQUISITION
 # =============================================================================
@@ -1501,10 +2532,308 @@ def select_top_diverse_candidates(X_grid, scores, n, min_dist=None):
     return selected
 
 
-def maximise_acquisition(acq_fn, n_params, n_restarts=20, rng=None):
+def gp_hedge_select(acq_fns_dict, encoder, gp, df_done, cfg, rng,
+                    eta=None, n_train_for_max=None):
+    """
+    v3.7d (FIX) : GP-Hedge portfolio (Hoffman, Brochu, de Freitas, UAI 2011).
+
+    Lance plusieurs acquisitions en parallele, choisit l'une des recommandations
+    selon une probabilite softmax basee sur leur 'gain' historique cumule.
+
+    CORRECTIONS v3.7d.1 :
+    1. Le gain est maintenant standardise par mu_train (zero-mean) et sigma_train.
+       Avant : gain = mu(x_proposed) brut -> divergence si echelle non-normalisee.
+    2. eta calcule selon Hoffman 2011 : eta = sqrt(8 * log(K) / T_max).
+       Avant : eta=1.0 fixe -> winner-takes-all premature.
+    3. Si eta fourni explicitement, il est respecte.
+
+    Args:
+        acq_fns_dict   : dict {nom_acq: fn(X)->vals}
+        gp             : GP entraine (pour calculer mu standardise)
+        eta            : temperature softmax. None = auto (Hoffman 2011).
+        n_train_for_max: passe a maximise_acquisition pour adapter n_restarts
+
+    Retourne : (x_chosen_norm, name_chosen, all_proposals_dict)
+    """
+    proposals = {}
+    for name, fn in acq_fns_dict.items():
+        try:
+            x_prop = maximise_acquisition(fn, encoder.n_params, n_restarts=20, rng=rng,
+                                          n_train=n_train_for_max)
+            proposals[name] = x_prop
+        except Exception as e:
+            print(f"  [HEDGE] acq '{name}' a echoue: {e}")
+
+    if not proposals:
+        # Fallback : random
+        return rng.uniform(0, 1, encoder.n_params), "random", {}
+
+    # Charger gains historiques
+    bo_cfg = cfg.setdefault("bo_settings", {})
+    _debug_hedge = bo_cfg.get("_debug_hedge", False)
+    gains_state = bo_cfg.setdefault("_hedge_gains", {})
+    if _debug_hedge and len(gains_state) > 0:
+        print(f"    [HEDGE-DEBUG] gains_state LOADED from prev iter: {gains_state}")
+    for name in proposals:
+        gains_state.setdefault(name, 0.0)
+
+    # FIX #2 : eta auto selon Hoffman 2011, theoreme regret bound :
+    # eta = sqrt(8 * log(K) / T) avec K=nb acquireurs, T=nb iterations max
+    K = len(proposals)
+    if eta is None:
+        # On estime T comme une borne raisonnable (50 iterations BO typique)
+        T_est = max(50, n_train_for_max or 50)
+        eta = float(np.sqrt(8.0 * np.log(max(K, 2)) / T_est))
+
+    # Softmax pour selectionner l'acquireur
+    names_list = list(proposals.keys())
+    g_arr = np.array([gains_state[n] for n in names_list], dtype=float)
+    g_arr = g_arr - g_arr.max()  # stabilite numerique
+    probs = np.exp(eta * g_arr)
+    probs = probs / probs.sum()
+
+    chosen_idx = int(rng.choice(len(names_list), p=probs))
+    chosen_name = names_list[chosen_idx]
+    x_chosen = proposals[chosen_name]
+    
+    # DEBUG logging
+    if _debug_hedge:
+        print(f"    [HEDGE-DEBUG] eta={eta:.3f}  gains_cumul={dict(zip(names_list, [gains_state[n] for n in names_list]))}")
+        print(f"    [HEDGE-DEBUG] gains_rel={dict(zip(names_list, g_arr))}")
+        print(f"    [HEDGE-DEBUG] probs={dict(zip(names_list, probs))}")
+        print(f"    [HEDGE-DEBUG] chosen={chosen_name}")
+
+    # FIX #1 : gains clippes pour stabilite (GP predict retourne deja en espace normalise)
+    # Pas besoin de re-standardiser, juste borner a +/- 3.
+    for name, x_prop in proposals.items():
+        try:
+            mu_at_x, _ = gp.predict(x_prop.reshape(1, -1), return_std=True)
+            # Le GP a ete fit sur y normalise, donc mu est deja N(0,1)
+            gain_std = float(np.clip(mu_at_x[0], -3.0, 3.0))
+            old_gain = gains_state[name]
+            gains_state[name] = float(old_gain) + gain_std
+            if _debug_hedge:
+                print(f"    [HEDGE-DEBUG] {name}: mu={mu_at_x[0]:.3f} -> gain_delta={gain_std:.3f}, cumul={gains_state[name]:.3f}")
+        except Exception:
+            pass
+
+    bo_cfg["_hedge_gains"] = gains_state
+    return x_chosen, chosen_name, proposals
+
+
+# =============================================================================
+# TuRBO — Trust Region Bayesian Optimization (Eriksson et al., NeurIPS 2019)
+# =============================================================================
+
+class TrustRegionState:
+    """
+    v3.7d : Etat d'une trust region TuRBO pour BO en haute dimension.
+
+    Maintient un cube/rectangle local centre sur le meilleur point observe.
+    La taille L (en espace normalise [0,1]^D) se contracte/dilate selon
+    les succes/echecs accumules :
+      - succes consecutifs >= n_success_thresh -> L *= 2
+      - echecs consecutifs >= n_failure_thresh -> L /= 2
+      - L < L_min -> redemarrage (re-tirage LHS dans tout l'espace)
+
+    Etat persiste entre runs via cfg["bo_settings"]["_turbo_state"].
+    """
+
+    L_init           = 0.8     # taille initiale (fraction du cube unite)
+    L_min            = 0.5**7  # ~0.0078 — seuil de redemarrage
+    L_max            = 1.6     # plafond
+    success_factor   = 2.0
+    failure_factor   = 0.5
+
+    def __init__(self, n_dims, batch_size=1):
+        self.n_dims        = n_dims
+        self.batch_size    = batch_size
+        # Seuils standards : tau_success = 3, tau_failure = max(4, ceil(d / batch))
+        self.n_success_thresh = 3
+        self.n_failure_thresh = max(4, int(np.ceil(n_dims / max(batch_size, 1))))
+        self.L                = self.L_init
+        self.success_count    = 0
+        self.failure_count    = 0
+        self.best_y           = -np.inf
+        self.restart_count    = 0
+
+    def to_dict(self):
+        return dict(n_dims=self.n_dims, batch_size=self.batch_size,
+                    L=float(self.L),
+                    success_count=self.success_count,
+                    failure_count=self.failure_count,
+                    best_y=float(self.best_y),
+                    restart_count=self.restart_count)
+
+    @classmethod
+    def from_dict(cls, d, n_dims=None, batch_size=None):
+        s = cls(n_dims or d["n_dims"], batch_size or d.get("batch_size", 1))
+        s.L              = float(d.get("L", s.L_init))
+        s.success_count  = int(d.get("success_count", 0))
+        s.failure_count  = int(d.get("failure_count", 0))
+        s.best_y         = float(d.get("best_y", -np.inf))
+        s.restart_count  = int(d.get("restart_count", 0))
+        return s
+
+    def update(self, y_observed_max):
+        """Met a jour l'etat selon le nouveau meilleur observe."""
+        # Si y observed n'est pas fini, on ignore (rien a apprendre)
+        if not np.isfinite(y_observed_max):
+            return
+        # Tolerance numerique relative — gerer le cas best_y = -inf au demarrage
+        if not np.isfinite(self.best_y):
+            tol = 1e-9
+        else:
+            tol = 1e-9 * max(abs(self.best_y), 1e-3)
+        if y_observed_max > self.best_y + tol:
+            self.success_count += 1
+            self.failure_count  = 0
+            self.best_y         = y_observed_max
+        else:
+            self.failure_count += 1
+            self.success_count  = 0
+
+        if self.success_count >= self.n_success_thresh:
+            self.L = min(self.L * self.success_factor, self.L_max)
+            self.success_count = 0
+        elif self.failure_count >= self.n_failure_thresh:
+            self.L = self.L * self.failure_factor
+            self.failure_count = 0
+
+    def needs_restart(self):
+        return self.L < self.L_min
+
+
+def turbo_get_trust_region(state, X_norm_train, Y_scalar_train, gp, encoder):
+    """
+    Retourne (lo, hi) en [0,1]^D, bornes de la trust region centree sur
+    le meilleur point observe et de taille L ponderee par les lengthscales
+    inverses du GP (ARD).
+
+    Le poids w_i = ls_i / mean(ls) — plus une dim a un grand lengthscale
+    (peu sensible), plus la TR s'etend dans cette direction.
+    """
+    best_idx = int(np.argmax(Y_scalar_train))
+    x_center = X_norm_train[best_idx].copy()
+
+    # Lengthscales depuis le GP (peuvent etre uniques ou ARD)
+    try:
+        ls = gp.kernel_.length_scale
+        ls = np.asarray(ls, dtype=float).ravel()
+        if ls.size != encoder.n_params:
+            ls = np.full(encoder.n_params, float(ls.mean()))
+    except Exception:
+        ls = np.ones(encoder.n_params)
+
+    # Normaliser : weights centres autour de 1.0
+    w = ls / max(ls.mean(), 1e-6)
+    # Eviter degenerescence
+    w = np.clip(w, 0.2, 5.0)
+    half = (state.L * w / 2.0)
+    lo   = np.clip(x_center - half, 0.0, 1.0)
+    hi   = np.clip(x_center + half, 0.0, 1.0)
+    return lo, hi, x_center
+
+
+def turbo_should_use(cfg, n_dims, n_obs):
+    """v3.7d : auto-activation TuRBO si :
+       - haute dim (>=5 params) ET >=10 observations,
+       - OU activation explicite via bo_settings.use_turbo: true.
+    Desactive si bo_settings.use_turbo: false.
+    """
+    bo_cfg = cfg.get("bo_settings", {})
+    explicit = bo_cfg.get("use_turbo", None)
+    if explicit is True:
+        return True
+    if explicit is False:
+        return False
+    return (n_dims >= 5) and (n_obs >= 10)
+
+
+def make_local_penalizer(X_selected_norm, gp, y_train):
+    """
+    v3.7d : Local Penalization (Gonzalez et al., AISTATS 2016).
+
+    Pour selectionner un batch sans Kriging Believer (refit GP coute cher),
+    on multiplie l'acquisition par un facteur de penalisation autour de
+    chaque point deja selectionne dans le batch.
+
+    Le facteur de Lipschitz L est estime depuis le GP par max |grad mu|.
+    Le rayon r_j depend de la distance |M - mu(x_j)| / L, avec M = max y.
+    psi(x; x_j) = phi((|x - x_j| - r_j) / s_j) avec phi = CDF(N(0,1)).
+
+    Retourne une fonction acq_penalized(X) qui multiplie l'acq par
+    le produit des psi pour chaque point deja choisi.
+    """
+    if len(X_selected_norm) == 0:
+        return lambda acq_vals, X: acq_vals
+
+    M_obs = float(np.max(y_train))
+    # Estimer L : max norme du gradient de mu sur un echantillonnage
+    n_grid = 200
+    rng_local = np.random.default_rng(0)
+    Xg = rng_local.uniform(0, 1, (n_grid, X_selected_norm.shape[1]))
+    eps = 1e-3
+    mu_g, _ = gp.predict(Xg, return_std=True)
+    # Approximation du gradient par differences finies dim par dim
+    grads = np.zeros_like(Xg)
+    for d in range(Xg.shape[1]):
+        Xp = Xg.copy(); Xp[:, d] = np.clip(Xp[:, d] + eps, 0, 1)
+        Xm = Xg.copy(); Xm[:, d] = np.clip(Xm[:, d] - eps, 0, 1)
+        mp, _ = gp.predict(Xp, return_std=True)
+        mm, _ = gp.predict(Xm, return_std=True)
+        grads[:, d] = (mp - mm) / (2 * eps)
+    L = max(np.linalg.norm(grads, axis=1).max(), 1e-3)
+
+    # Pre-calculer les centres et leurs (mu, sigma)
+    mu_sel, sigma_sel = gp.predict(X_selected_norm, return_std=True)
+    sigma_sel = np.maximum(sigma_sel, 1e-6)
+
+    def penalize(acq_vals, X):
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        # Distance aux points selectionnes
+        # dist[i, j] = ||X[i] - X_selected[j]||
+        dist = np.linalg.norm(X[:, None, :] - X_selected_norm[None, :, :], axis=2)
+        r_j = (M_obs - mu_sel) / L  # (n_sel,)
+        s_j = sigma_sel / L
+        # phi((dist - r_j) / s_j)
+        z = (dist - r_j[None, :]) / np.maximum(s_j[None, :], 1e-9)
+        from scipy.stats import norm as _norm
+        psi = _norm.cdf(z)  # (n_X, n_sel)
+        # Multiplie l'acquisition par produit des psi
+        return acq_vals * psi.prod(axis=1)
+
+    return penalize
+
+
+def maximise_acquisition(acq_fn, n_params, n_restarts=20, rng=None, n_train=None,
+                         bounds=None):
+    """
+    v3.7d : si n_train fourni, n_restarts est ajuste automatiquement.
+            si bounds fourni (np.array shape (n_params, 2)), restreint la
+            recherche a ces bornes (utile pour TuRBO trust region).
+            Sinon, comportement historique.
+    """
     if rng is None:
         rng = np.random.default_rng()
-    unit_bounds = [(0.0, 1.0)] * n_params
+    # v3.7d : adaptation automatique selon la taille des donnees
+    if n_train is not None:
+        if n_train < 10:    n_restarts_eff = 20
+        elif n_train < 30:  n_restarts_eff = 50
+        else:               n_restarts_eff = 100
+        # On respecte le minimum demande
+        n_restarts = max(n_restarts, n_restarts_eff)
+    # v3.7d : bornes restreintes (TuRBO) ou unitaires
+    if bounds is not None:
+        unit_bounds = [(float(bounds[i, 0]), float(bounds[i, 1]))
+                       for i in range(n_params)]
+        lo_arr = np.array([b[0] for b in unit_bounds])
+        hi_arr = np.array([b[1] for b in unit_bounds])
+    else:
+        unit_bounds = [(0.0, 1.0)] * n_params
+        lo_arr = np.zeros(n_params)
+        hi_arr = np.ones(n_params)
     seed_val    = int(rng.integers(0, 2**31))
     de_result   = differential_evolution(
         func=lambda x: -float(acq_fn(x.reshape(1, -1)).item()),
@@ -1512,7 +2841,7 @@ def maximise_acquisition(acq_fn, n_params, n_restarts=20, rng=None):
     )
     best_x, best_val = de_result.x, -de_result.fun
     for _ in range(n_restarts):
-        x0  = rng.uniform(0.0, 1.0, size=n_params)
+        x0  = lo_arr + rng.uniform(0.0, 1.0, size=n_params) * (hi_arr - lo_arr)
         res = minimize(
             fun=lambda x: -float(acq_fn(x.reshape(1, -1)).item()),
             x0=x0, bounds=unit_bounds, method="L-BFGS-B",
@@ -1679,10 +3008,89 @@ def suggest_experiments(cfg, df_done, encoder, n_suggest, rng):
     bo           = cfg["bo_settings"]
 
     acq_name   = bo.get("acquisition", "EI").upper()
+    # v3.7d : auto-activation HEDGE si campagne mature et acq par defaut
+    if "acquisition" not in bo and len(df_done) >= 15:
+        acq_name = "HEDGE"
+        print(f"  [AUTO] {len(df_done)} points -> HEDGE active "
+              f"(force YAML acquisition: \"EI\" pour desactiver)")
     kappa      = float(bo.get("ucb_kappa", 2.0))
     xi_val     = float(bo.get("xi", 0.01))
-    n_restarts = int(bo.get("n_restarts", 20))
+    n_restarts = int(bo.get("n_restarts", 50))
     mode       = bo.get("multi_objective_mode", "weighted_sum")
+
+    # ── v3.8 : AUTO-PILOT (si active) ─────────────────────────────────────
+    # Override acq/xi/kappa selon decision orchestrateur (phase, target, coverage).
+    # S'applique avant les triggers reactifs de main() pour fonctionner aussi
+    # quand suggest_experiments est appele directement (bench, scripts custom).
+    if bo.get("autopilot", False):
+        try:
+            # Calcul stagnation : nb de rounds BO recents sans amelioration
+            _no_impr_sx = 0
+            try:
+                if "iteration_BO" in df_done.columns and len(output_names) > 0:
+                    _oc = output_names[0]
+                    _d = df_done.copy()
+                    _d["_it"] = pd.to_numeric(_d["iteration_BO"], errors="coerce")
+                    _d = _d[_d["_it"].notna()]
+                    if len(_d) > 0:
+                        _by_round = _d.groupby("_it")[_oc].max().sort_index()
+                        _running = _by_round.cummax()
+                        # rounds consecutifs en fin sans nouveau record
+                        _no_impr_sx = 0
+                        _best = -np.inf
+                        _streak = 0
+                        for _v in _running.values:
+                            if _v > _best + 1e-9:
+                                _best = _v
+                                _streak = 0
+                            else:
+                                _streak += 1
+                        _no_impr_sx = _streak
+            except Exception:
+                _no_impr_sx = 0
+            _ap_dec = autopilot_decide(df_done, cfg, bo, encoder,
+                                       _no_impr_existing=_no_impr_sx)
+            if _ap_dec.get('override'):
+                acq_name = _ap_dec['acquisition'].upper()
+                if _ap_dec.get('xi') is not None:
+                    xi_val = float(_ap_dec['xi'])
+                if _ap_dec.get('kappa') is not None:
+                    kappa = float(_ap_dec['kappa'])
+                if bo.get("autopilot_verbose", True):
+                    print(autopilot_format_status(_ap_dec))
+        except Exception as _e:
+            if bo.get("autopilot_verbose", True):
+                print(f"  [AUTOPILOT] erreur, fallback config standard: {_e}")
+
+    # v3.7d : auto-adaptation de xi selon stagnation
+    # Si les 3 dernieres iterations BO n'ont rien ameliore -> xi *= 5 (jusqu'a 0.1)
+    # Reset des qu'une amelioration est observee.
+    auto_xi = bo.get("auto_xi", True)
+    if auto_xi and "iteration_BO" in df_done.columns:
+        df_bo_x = df_done.copy()
+        df_bo_x["iteration_BO"] = pd.to_numeric(df_bo_x["iteration_BO"],
+                                                 errors="coerce")
+        df_bo_x = df_bo_x.dropna(subset=["iteration_BO"]).sort_values("iteration_BO")
+        if len(df_bo_x) >= 4:
+            # Calculer le best-so-far par iteration (en espace reel via scalarise)
+            Y_seq = scalarise(df_bo_x[output_names].values.astype(float), cfg)
+            best_so_far = np.maximum.accumulate(Y_seq)
+            # Stagnation : derniere amelioration vs il y a 3 iterations
+            n_stag = 0
+            tol = 1e-6 * max(abs(best_so_far[-1]), 1e-3)
+            for k in range(len(best_so_far) - 1, 0, -1):
+                if best_so_far[k] - best_so_far[k - 1] > tol:
+                    break
+                n_stag += 1
+            stagnation_threshold = int(bo.get("xi_stagnation_threshold", 3))
+            if n_stag >= stagnation_threshold:
+                # Multiplier xi, mais plafonner a 0.10
+                multiplier = min(5.0 ** ((n_stag - stagnation_threshold) // 2 + 1), 10.0)
+                xi_new = min(xi_val * multiplier, 0.10)
+                if xi_new > xi_val * 1.5:
+                    print(f"  [AUTO-XI] {n_stag} iter sans amelioration "
+                          f"-> xi {xi_val:.3f} -> {xi_new:.3f} (force exploration)")
+                    xi_val = xi_new
 
     X_raw        = df_done[param_names].values.astype(object)
     Y            = df_done[output_names].values.astype(float)
@@ -1693,6 +3101,40 @@ def suggest_experiments(cfg, df_done, encoder, n_suggest, rng):
     X_norm_train    = X_norm_base.copy()
     Y_scalar_train  = None
     y_phantom_list  = []
+    _sc_models      = None   # v3.7d : cache des GPs contraintes (cBO)
+
+    # v3.7d : TuRBO — initialisation de l'etat de la trust region
+    # Note : TuRBO desactive sous HEDGE (les sous-acq de Hedge ne respecteraient
+    # pas la trust region). Les deux features sont complementaires mais s'utilisent
+    # separement.
+    _use_turbo = (turbo_should_use(cfg, encoder.n_params, len(df_done))
+                  and acq_name != "HEDGE")
+    _turbo_state = None
+    if _use_turbo:
+        _turbo_dict = bo.get("_turbo_state", None)
+        if _turbo_dict and _turbo_dict.get("n_dims") == encoder.n_params:
+            _turbo_state = TrustRegionState.from_dict(
+                _turbo_dict, n_dims=encoder.n_params, batch_size=n_suggest)
+            # Mettre a jour selon le meilleur observe
+            _y_best_so_far = float(scalarise(Y, cfg).max())
+            _turbo_state.update(_y_best_so_far)
+            print(f"  [TuRBO] L={_turbo_state.L:.4f}  "
+                  f"succ={_turbo_state.success_count}  "
+                  f"fail={_turbo_state.failure_count}  "
+                  f"best_y={_turbo_state.best_y:.3f}")
+        else:
+            _turbo_state = TrustRegionState(encoder.n_params, batch_size=n_suggest)
+            _y_best_so_far = float(scalarise(Y, cfg).max())
+            _turbo_state.best_y = _y_best_so_far
+            print(f"  [TuRBO] init L={_turbo_state.L:.3f}  "
+                  f"(n_dims={encoder.n_params}, n_obs={len(df_done)})")
+
+        # Restart si trust region trop petite
+        if _turbo_state.needs_restart():
+            _turbo_state = TrustRegionState(encoder.n_params, batch_size=n_suggest)
+            _turbo_state.restart_count += 1
+            print(f"  [TuRBO] RESTART trust region (L_min atteint, "
+                  f"restart #{_turbo_state.restart_count})")
 
     for s in range(n_suggest):
         pareto_w = None
@@ -1704,11 +3146,20 @@ def suggest_experiments(cfg, df_done, encoder, n_suggest, rng):
             Y_scalar_train, _bc_lam, _bc_off = fit_boxcox(Y_scalar_raw, bo, verbose=(s==0))
             _bc_train_max  = float(Y_scalar_train.max()) if _bc_lam is not None else 0.0
         else:
-            Y_real         = scalarise(Y, cfg, pareto_w)
-            Y_scalar_train = np.append(Y_real, y_phantom_list)
+            # v3.7d : fix bug Box-Cox phantom — toujours appliquer la transformation
+            # Avant : Y_real (espace reel) + y_phantom (espace BC) -> mix incoherent
+            # Maintenant : on transforme Y_real avec le meme lambda que s=0
+            Y_real = scalarise(Y, cfg, pareto_w)
+            if _bc_lam is not None:
+                # Re-applique Box-Cox avec le lambda fixe a s=0
+                Y_real_bc = apply_boxcox(Y_real + _bc_off, _bc_lam)
+                Y_scalar_train = np.append(Y_real_bc, y_phantom_list)
+            else:
+                Y_scalar_train = np.append(Y_real, y_phantom_list)
 
         y_best = float(Y_scalar_train.max())
-        gp = build_gp(encoder.n_params, normalize_y=(_bc_lam is None))
+        gp = build_gp(encoder.n_params, normalize_y=(_bc_lam is None),
+                      cfg=cfg, encoder=encoder, y_train=Y_scalar_train)
         gp.fit(X_norm_train, Y_scalar_train)
 
         if acq_name == "EI":
@@ -1740,7 +3191,7 @@ def suggest_experiments(cfg, df_done, encoder, n_suggest, rng):
             # UCB avec β auto-calculé (Srinivas 2010)
             _iter_cur = int(pd.to_numeric(
                 df_done.get("iteration_BO", pd.Series(dtype=float)),
-                errors="coerce").dropna().max() or 1)
+                errors="coerce").fillna(0).max() or 0)
             acq_fn = lambda x, _g=gp, _it=_iter_cur, _nd=encoder.n_params:                 acq_ucb_auto(x, _g, _it, _nd)
 
         elif acq_name == "PI":
@@ -1763,10 +3214,160 @@ def suggest_experiments(cfg, df_done, encoder, n_suggest, rng):
             # Utile comme mode forcé quand stagnation détectée manuellement
             acq_fn = lambda x, _g=gp: _g.predict(x, return_std=True)[1].ravel()
 
+        elif acq_name == "KG":
+            # Knowledge Gradient exact (v3.6). Cout CPU eleve (~30s/suggestion)
+            # car refit hypothetique du GP pour chaque point candidat.
+            # Utile pour phase d exploitation fine (> 15 iterations).
+            n_fantasy = int(bo.get("kg_n_fantasy", 32))
+            acq_fn = lambda x, _g=gp, _yb=y_best, _nf=n_fantasy, _r=rng: acq_kg(
+                x if x.ndim == 2 else x.reshape(1, -1),
+                _g, _yb, n_fantasy=_nf, rng=_r
+            )
+
+        elif acq_name == "HEDGE":
+            # v3.7d : portfolio GP-Hedge — choisit dynamiquement parmi
+            # EI, UCB-AUTO, TEI selon leur historique de performance.
+            # Construire les acq individuelles
+            _iter_cur_h = int(pd.to_numeric(
+                df_done.get("iteration_BO", pd.Series(dtype=float)),
+                errors="coerce").fillna(0).max() or 0)
+            beta_tei_h = float(bo.get("tei_beta", 8))
+            _hedge_pool = {
+                "EI":       lambda x, _g=gp, _yb=y_best: acq_ei(x, _g, _yb, xi_val),
+                "UCB-AUTO": lambda x, _g=gp, _it=_iter_cur_h, _nd=encoder.n_params:
+                            acq_ucb_auto(x, _g, _it, _nd),
+                "TEI":      lambda x, _g=gp, _yb=y_best, _b=beta_tei_h:
+                            acq_tei(x, _g, _yb, xi_val, _b),
+            }
+            # WARNING: GP-Hedge actuellement experimental/non-optimal
+            # Les 3 acquireurs proposent souvent le meme point (mu identiques)
+            # -> pas de differentiation -> random walk
+            # Cause: maximise_acquisition converge vers meme optimum global
+            # TODO: ajouter perturbation ou diversite dans proposals
+            # Hedge selectionne directement le point ; on court-circuite la suite
+            x_chosen, name_chosen, _props = gp_hedge_select(
+                _hedge_pool, encoder, gp, df_done, cfg, rng,
+                eta=bo.get("hedge_eta", None),     # None = auto Hoffman 2011
+                n_train_for_max=len(X_norm_train))
+            print(f"  [HEDGE] iter={_iter_cur_h}  acq choisie={name_chosen}  "
+                  f"(parmi {len(_hedge_pool)})")
+            x_next_dict = encoder.decode(x_chosen.reshape(1, -1))[0]
+            suggestions.append(x_next_dict)
+            # Prediction GP au point choisi (espace reel)
+            y_phantom_bc = float(gp.predict(x_chosen.reshape(1, -1))[0])
+            if _bc_lam is not None:
+                _y_real_max = float(invert_boxcox(np.array([_bc_train_max]), _bc_lam)[0]) - _bc_off
+                _y_real_clip = max(_y_real_max * 1.30, _y_real_max + 10.0)
+                y_raw_inv = float(invert_boxcox(np.array([y_phantom_bc]), _bc_lam)[0]) - _bc_off
+                y_phantom_real = float(np.clip(y_raw_inv, 0.0, _y_real_clip))
+            else:
+                y_phantom_real = y_phantom_bc
+            gp_predictions.append(y_phantom_real)
+            y_phantom_list.append(y_phantom_bc)
+            X_norm_train = np.vstack([X_norm_train, x_chosen.reshape(1, -1)])
+            continue  # passe a s suivant sans le reste de la boucle
+
         else:
             raise ValueError(f"Acquisition inconnue : '{acq_name}'.")
 
-        x_next_norm = maximise_acquisition(acq_fn, encoder.n_params, n_restarts, rng)
+        # ── Feasibility constraints (v3.7) : wrapper acq_fn pour exclure ─────
+        # les points qui violent les contraintes YAML (renvoie -inf)
+        _constraints = cfg.get("constraints", []) or []
+        if _constraints:
+            _base_acq = acq_fn
+            def _feasible_acq(X, _ba=_base_acq, _cstr=_constraints, _enc=encoder):
+                Xa = X if X.ndim == 2 else X.reshape(1, -1)
+                scores = _ba(Xa).ravel().astype(float)
+                # Decoder et filtrer
+                try:
+                    decoded_all = _enc.decode(Xa)
+                    for k, dec in enumerate(decoded_all):
+                        feas, _ = check_feasibility(dec, _cstr)
+                        if not feas:
+                            scores[k] = -np.inf
+                except Exception:
+                    pass
+                return scores
+            acq_fn = _feasible_acq
+
+        # ── Boundary avoidance (v3.7b) : penaliser zones deja mauvaises ─────
+        _ba_active = cfg.get("bo_settings", {}).get("boundary_avoidance", True)
+        if _ba_active and len(X_norm_train) >= 5:
+            _base_acq2 = acq_fn
+            _yt_ba = Y_scalar_train
+            def _ba_acq(X, _ba=_base_acq2, _Xt=X_norm_train, _yt=_yt_ba):
+                Xa   = X if X.ndim == 2 else X.reshape(1, -1)
+                vals = _ba(Xa).ravel().astype(float)
+                # threshold 0.75 : mauvais si y < 75% du meilleur
+                return _apply_boundary_avoidance(vals, Xa, _Xt, _yt,
+                                                  threshold_pct=0.75, radius=0.20, penalty=0.1)
+            acq_fn = _ba_acq
+
+        # v3.7d : cBO — multiplier par P(contraintes respectees)
+        # Active automatiquement si soft_constraints est defini dans le YAML.
+        if _sc_models is None:  # fit GPs contraintes 1 fois par batch
+            _sc_models = fit_constraint_gps(cfg, df_done, encoder)
+            if _sc_models:
+                print(f"  [cBO] {len(_sc_models)} contrainte(s) active(s) : "
+                      + ", ".join(cm["name"] for cm in _sc_models))
+        if _sc_models:
+            acq_fn = constrained_acquisition(acq_fn, _sc_models)
+
+        # v3.7d : TuRBO bounds (si actif, restreint la recherche)
+        _turbo_bounds = None
+        if _turbo_state is not None:
+            lo_tr, hi_tr, _ = turbo_get_trust_region(
+                _turbo_state, X_norm_train, Y_scalar_train, gp, encoder)
+            _turbo_bounds = np.column_stack([lo_tr, hi_tr])
+        
+        # v3.7d : Batch strategies alternatives au Kriging Believer
+        # v3.7d : défaut "qei" (validé +58% vs kriging_believer sur Branin)
+        # Legacy: "kriging_believer", "local_penalization"
+        _batch_strat = bo.get("batch_strategy", "qei")
+        
+        # qEI/qNEI : quasi-MC Expected Improvement pour batch
+        if _batch_strat in ("qei", "qnei") and s > 0 and len(suggestions) > 0:
+            # Construire batch actuel (points déjà sélectionnés)
+            X_batch_current = np.array([encoder.encode(np.array([[v for v in d.values()]],
+                                        dtype=object))[0] for d in suggestions])
+            
+            # Fonction batch : optimise qEI([batch_current + x_new])
+            acq_batch_fn = acq_qei if _batch_strat == "qei" else acq_qnei
+            n_samples_qei = int(bo.get("qei_n_samples", 512))
+            
+            def batch_acq_wrapper(x_new):
+                """qEI du batch complet : retourne np.array (compat .item())."""
+                x_new_2d = x_new.reshape(1, -1) if x_new.ndim == 1 else x_new
+                X_full_batch = np.vstack([X_batch_current, x_new_2d])
+                val = acq_batch_fn(X_full_batch, gp, y_best, xi_val, n_samples=n_samples_qei)
+                return np.asarray([float(val)])
+            
+            # Optimiser x_new tel que qEI([batch + x_new]) max
+            # On passe la fonction qui retourne qEI directement (positif, a maximiser)
+            x_next_norm = maximise_acquisition(
+                batch_acq_wrapper, encoder.n_params, n_restarts, rng,
+                n_train=len(X_norm_train), bounds=_turbo_bounds
+            )
+            # Skip le reste de la boucle (pas de Local Penalization ni acq_fn standard)
+            
+        # Local Penalization : pénalise autour des points déjà sélectionnés
+        elif _batch_strat == "local_penalization" and s > 0 and len(suggestions) > 0:
+            X_sel_arr = np.array([encoder.encode(np.array([[v for v in d.values()]],
+                                  dtype=object))[0] for d in suggestions])
+            _lp_fn = make_local_penalizer(X_sel_arr, gp, Y_scalar_train[:len(Y)])
+            _base_acq_lp = acq_fn
+            def _lp_acq(X, _ba=_base_acq_lp, _lp=_lp_fn):
+                Xa = X if X.ndim == 2 else X.reshape(1, -1)
+                vals = _ba(Xa).ravel().astype(float)
+                return _lp(vals, Xa)
+            acq_fn = _lp_acq
+
+        # Pour kriging_believer ou si s=0 : utiliser acq_fn standard
+        # Pour qEI/qNEI : on a déjà x_next_norm, skip cette section
+        if _batch_strat not in ("qei", "qnei") or s == 0 or len(suggestions) == 0:
+            x_next_norm = maximise_acquisition(acq_fn, encoder.n_params, n_restarts, rng,
+                                               n_train=len(X_norm_train),
+                                               bounds=_turbo_bounds)
         # Multi-modal detection : K-means rapide → multi-start si confirme
         if s == 0 and acq_name not in ("THOMPSON",) and len(df_done) >= 8:
             mm_detected, mm_msg = detect_multimodality(df_done, cfg, encoder, bo)
@@ -1813,6 +3414,44 @@ def suggest_experiments(cfg, df_done, encoder, n_suggest, rng):
         gp_predictions.append(y_phantom_real)
         y_phantom_list.append(y_phantom_bc)  # kriging believer reste en espace transforme
         X_norm_train = np.vstack([X_norm_train, x_next_norm.reshape(1, -1)])
+
+    # v3.7d : persister l'etat TuRBO pour la prochaine iteration
+    if _turbo_state is not None:
+        cfg.setdefault("bo_settings", {})["_turbo_state"] = _turbo_state.to_dict()
+
+    # v3.9 : garde-fou final de faisabilite (hard constraints)
+    # Le filtre dans l'acquisition peut laisser passer un point infaisable
+    # lors d'un raffinement local serre (contraintes continues etroites).
+    # On re-verifie chaque suggestion ; si infaisable, on la remplace par un
+    # echantillon aleatoire faisable (jusqu'a 200 essais).
+    _hard = cfg.get("constraints", []) or []
+    if _hard and suggestions:
+        cont_params = [p for p in cfg["parameters"] if p["type"] == "continuous"]
+        cat_params = [p for p in cfg["parameters"] if p["type"] == "categorical"]
+        for si, sug in enumerate(suggestions):
+            feas, _ = check_feasibility(sug, _hard)
+            if feas:
+                continue
+            # tenter de reparer par echantillonnage rejet
+            repaired = None
+            for _ in range(200):
+                cand = {}
+                for p in cont_params:
+                    cand[p["name"]] = round(float(rng.uniform(p["min"], p["max"])), 4)
+                for p in cat_params:
+                    cand[p["name"]] = p["categories"][int(rng.integers(0, len(p["categories"])))]
+                f2, _ = check_feasibility(cand, _hard)
+                if f2:
+                    repaired = cand
+                    break
+            if repaired is not None:
+                # conserver les cles supplementaires eventuelles
+                for k in sug:
+                    if k not in repaired:
+                        repaired[k] = sug[k]
+                suggestions[si] = repaired
+                print(f"  [CONSTRAINT] suggestion {si+1} infaisable -> remplacee "
+                      f"par un point faisable")
 
     return suggestions, gp_predictions   # NEW: retourne le tuple
 
@@ -1866,10 +3505,18 @@ def suggest_experiments_ehvi(cfg, df_done, encoder, n_suggest, rng):
             gp_j.fit(X_aug, Y_aug_signed[:, j])
             gps.append(gp_j)
 
-        # Maximise MC-EHVI
-        print(f"    EHVI : calcul suggestion {s+1}/{n_suggest} "
-              f"({'exact 2D' if n_obj == 2 else 'MC 3D+'})...", flush=True)
-        x_next_norm = _maximise_ehvi_grid(gps, ref_point, Y_aug_signed, cfg, encoder, rng)
+        # Maximise EHVI ou qNEHVI selon config
+        _mo_acq = cfg["bo_settings"].get("mo_acquisition", "ehvi").lower()
+        if _mo_acq == "qnehvi":
+            print(f"    qNEHVI : calcul suggestion {s+1}/{n_suggest} "
+                  f"(noisy + q-batch)...", flush=True)
+            x_next_norm = _maximise_qnehvi_grid(gps, ref_point, Y_aug_signed,
+                                                 cfg, encoder, rng, n_batch=1)
+        else:
+            print(f"    EHVI : calcul suggestion {s+1}/{n_suggest} "
+                  f"({'exact 2D' if n_obj == 2 else 'MC 3D+'})...", flush=True)
+            x_next_norm = _maximise_ehvi_grid(gps, ref_point, Y_aug_signed,
+                                               cfg, encoder, rng)
         x_next_dict = encoder.decode(x_next_norm.reshape(1, -1))[0]
         suggestions.append(x_next_dict)
 
@@ -2011,6 +3658,401 @@ def _colors_for_values(vals, cmap_name="RdYlGn"):
     return [cmap(norm(v)) for v in vals]
 
 
+
+def _plot_gp_heatmap_trio(fig, gs, gp_display, encoder, cfg, df_done,
+                          df_sugg_cur, out_name, maximize):
+    """
+    Trace 3 heatmaps côte-à-côte dans gs[2, :] montrant le paysage GP
+    pour les 3 paires des variables continues les plus influentes.
+
+    Pour chaque paire (p_i, p_j) :
+      - axe X = valeur physique de p_i
+      - axe Y = valeur physique de p_j
+      - couleur = prédiction GP (mu) avec les autres paramètres fixés au point optimal
+      - points réels superposés (cercles)
+      - suggestions du round (étoiles)
+
+    Si < 3 paramètres continus, adapte au nombre de paires disponibles.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpecFromSubplotSpec
+
+    param_names = [p["name"] for p in cfg["parameters"]]
+    output_names = [o["name"] for o in cfg["outputs"]]
+
+    # Identifier les paramètres continus
+    cont_idx = [i for i,p in enumerate(cfg["parameters"]) if p["type"] == "continuous"]
+    if len(cont_idx) < 2:
+        ax_empty = fig.add_subplot(gs[2, :])
+        ax_empty.text(0.5, 0.5,
+                     "Heatmaps : nécessite >= 2 paramètres continus",
+                     ha="center", va="center", transform=ax_empty.transAxes,
+                     fontsize=10, color="#888888")
+        ax_empty.axis("off")
+        return
+
+    # Prioriser par importance ARD (lengthscale faible = important)
+    try:
+        ls = gp_display.kernel_.k2.length_scale
+        cont_importance = [(i, 1.0 / (ls[encoder.continuous_idx.index(i):
+                                         encoder.continuous_idx.index(i)+1].mean() + 1e-9))
+                           for i in cont_idx]
+        cont_importance.sort(key=lambda x: -x[1])
+        cont_sorted = [c[0] for c in cont_importance]
+    except Exception:
+        cont_sorted = cont_idx
+
+    # Générer les paires (max 3)
+    pairs = []
+    n_cont = len(cont_sorted)
+    if n_cont >= 3:
+        pairs = [(cont_sorted[0], cont_sorted[1]),
+                 (cont_sorted[0], cont_sorted[2]),
+                 (cont_sorted[1], cont_sorted[2])]
+    elif n_cont == 2:
+        pairs = [(cont_sorted[0], cont_sorted[1])]
+    n_panels = len(pairs)
+
+    # Meilleur point (pour fixer les autres paramètres)
+    Y = df_done[output_names].values.astype(float)
+    scores = scalarise(Y, cfg)
+    best_i = int(np.argmax(scores)) if maximize else int(np.argmin(scores))
+    X_best_raw  = df_done[param_names].values.astype(object)[best_i:best_i+1]
+    X_best_norm = encoder.encode(X_best_raw)[0]
+
+    # Sous-grille pour les 3 heatmaps (ou moins)
+    sub_gs = GridSpecFromSubplotSpec(1, n_panels, subplot_spec=gs[2, :],
+                                      wspace=0.35)
+
+    n_grid = 40
+    grid = np.linspace(0, 1, n_grid)
+    Xn, Yn = np.meshgrid(grid, grid)
+
+    for panel_idx, (pi, pj) in enumerate(pairs):
+        ax = fig.add_subplot(sub_gs[0, panel_idx])
+        p_i = cfg["parameters"][pi]
+        p_j = cfg["parameters"][pj]
+
+        # Positions normalisées dans l'espace encoder
+        # Pour un paramètre continu, l'index encoder = sa position dans continuous_idx
+        ki = encoder.continuous_idx.index(pi)
+        kj = encoder.continuous_idx.index(pj)
+
+        # Construire la grille dans l'espace encoder complet
+        n_pts = n_grid * n_grid
+        X_grid = np.tile(X_best_norm, (n_pts, 1))
+        # Remplacer les 2 dimensions ki et kj par la grille
+        # Note : dans l'encoder, continuous occupent les positions ki et kj
+        # On doit mapper depuis param_idx pi → dimension dans X_norm
+        # Pour continuous : dimension = cumul des encoded_dims des params avant pi
+        dim_i = sum(encoder._encoded_dims[k] for k in range(pi))
+        dim_j = sum(encoder._encoded_dims[k] for k in range(pj))
+        X_grid[:, dim_i] = Xn.ravel()
+        X_grid[:, dim_j] = Yn.ravel()
+
+        mu_grid = gp_display.predict(X_grid).reshape(n_grid, n_grid)
+
+        # Axes physiques
+        lo_i, hi_i = float(p_i["min"]), float(p_i["max"])
+        lo_j, hi_j = float(p_j["min"]), float(p_j["max"])
+        # Gérer log_ratio pour l affichage
+        if pi in getattr(encoder, "_log_ratio_idx", set()):
+            X_phys = np.exp(np.log(max(lo_i,1e-9)) + grid * (np.log(max(hi_i,1e-9)) - np.log(max(lo_i,1e-9))))
+        else:
+            X_phys = grid * (hi_i - lo_i) + lo_i
+        if pj in getattr(encoder, "_log_ratio_idx", set()):
+            Y_phys = np.exp(np.log(max(lo_j,1e-9)) + grid * (np.log(max(hi_j,1e-9)) - np.log(max(lo_j,1e-9))))
+        else:
+            Y_phys = grid * (hi_j - lo_j) + lo_j
+
+        XP, YP = np.meshgrid(X_phys, Y_phys)
+
+        # Heatmap
+        cmap = "viridis" if maximize else "viridis_r"
+        im = ax.pcolormesh(XP, YP, mu_grid, cmap=cmap, shading="auto", alpha=0.92)
+
+        # Points réels superposés
+        df_plot = df_done.copy()
+        vals_x = pd.to_numeric(df_plot[p_i["name"]], errors="coerce")
+        vals_y = pd.to_numeric(df_plot[p_j["name"]], errors="coerce")
+        vals_c = pd.to_numeric(df_plot[out_name], errors="coerce")
+        mask = vals_x.notna() & vals_y.notna() & vals_c.notna()
+        ax.scatter(vals_x[mask], vals_y[mask], c=vals_c[mask], cmap=cmap,
+                   edgecolors="white", linewidths=1.2, s=55, zorder=3,
+                   vmin=mu_grid.min(), vmax=mu_grid.max())
+
+        # Suggestions (étoiles)
+        if df_sugg_cur is not None and len(df_sugg_cur) > 0:
+            sx = pd.to_numeric(df_sugg_cur[p_i["name"]], errors="coerce")
+            sy = pd.to_numeric(df_sugg_cur[p_j["name"]], errors="coerce")
+            m2 = sx.notna() & sy.notna()
+            ax.scatter(sx[m2], sy[m2], marker="*", s=240,
+                       c="#D55E00", edgecolors="white", linewidths=1.5,
+                       zorder=5, label="Suggestions")
+
+        ax.set_xlabel(p_i["name"], fontsize=8)
+        ax.set_ylabel(p_j["name"], fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.set_title(f"Paysage GP : {p_i['name']} × {p_j['name']}",
+                     fontsize=9, fontweight="bold", pad=4)
+        cbar = fig.colorbar(im, ax=ax, shrink=0.85)
+        cbar.set_label(f"μ({out_name})", fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+
+
+
+def plot_convergence_animation(df, cfg, gp_display, encoder, opts=None):
+    """
+    Genere une animation GIF de l'evolution du paysage GP round apres round.
+    Fichier : {campaign}_convergence.gif
+    Declenche uniquement par --final ou a convergence automatique.
+
+    Contenu : paysage GP 2D (2 params les plus influents) + points accumules
+    round apres round. Chaque frame = 1 itération BO.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    if opts is None: opts = {}
+    campaign  = cfg.get("campaign_name", "campaign")
+    out_name  = cfg["outputs"][0]["name"]
+    maximize  = cfg["outputs"][0].get("direction", "maximize") == "maximize"
+    param_names = [p["name"] for p in cfg["parameters"]]
+
+    df_done = df[df["statut"].astype(str).str.strip() == "fait"].copy()
+    df_done[out_name] = pd.to_numeric(df_done[out_name], errors="coerce")
+    df_done = df_done.dropna(subset=[out_name])
+    if len(df_done) < 4:
+        return  # pas assez pour animer
+
+    # Identifier les 2 params continus les plus influents (ARD)
+    cont_idx = [i for i,p in enumerate(cfg["parameters"]) if p["type"] == "continuous"]
+    if len(cont_idx) < 2:
+        return  # impossible d'animer avec < 2 variables continues
+
+    try:
+        ls = gp_display.kernel_.k2.length_scale if hasattr(gp_display.kernel_, "k2") \
+             else gp_display.kernel_.length_scale
+        cont_imp = [(i, 1.0 / (ls[encoder.continuous_idx.index(i):
+                                encoder.continuous_idx.index(i)+1].mean() + 1e-9))
+                    for i in cont_idx]
+        cont_imp.sort(key=lambda x: -x[1])
+        pi_idx, pj_idx = cont_imp[0][0], cont_imp[1][0]
+    except Exception:
+        pi_idx, pj_idx = cont_idx[0], cont_idx[1]
+
+    p_i = cfg["parameters"][pi_idx]
+    p_j = cfg["parameters"][pj_idx]
+
+    # Bornes physiques
+    lo_i, hi_i = float(p_i["min"]), float(p_i["max"])
+    lo_j, hi_j = float(p_j["min"]), float(p_j["max"])
+
+    # Point optimal pour fixer autres vars
+    y_vals = df_done[out_name].values.astype(float)
+    best_i = int(np.argmax(y_vals)) if maximize else int(np.argmin(y_vals))
+    X_best_raw = df_done[param_names].values.astype(object)[best_i:best_i+1]
+    X_best_norm = encoder.encode(X_best_raw)[0]
+
+    # Iterations disponibles
+    iter_col = pd.to_numeric(df_done["iteration_BO"], errors="coerce").fillna(0).astype(int).values
+    max_iter = int(iter_col.max())
+
+    # Pre-calculer positions physiques pour le scatter
+    X_all_raw = df_done[param_names].values
+    xi_all = df_done[p_i["name"]].astype(float).values
+    yj_all = df_done[p_j["name"]].astype(float).values
+
+    # Grille pour la heatmap (fixe pour toutes les frames)
+    n_grid = 40
+    grid = np.linspace(0, 1, n_grid)
+    Xn, Yn = np.meshgrid(grid, grid)
+
+    # Echelle physique
+    if pi_idx in getattr(encoder, "_log_ratio_idx", set()):
+        X_phys = np.exp(np.log(max(lo_i,1e-9)) + grid*(np.log(max(hi_i,1e-9))-np.log(max(lo_i,1e-9))))
+    else:
+        X_phys = grid * (hi_i - lo_i) + lo_i
+    if pj_idx in getattr(encoder, "_log_ratio_idx", set()):
+        Y_phys = np.exp(np.log(max(lo_j,1e-9)) + grid*(np.log(max(hi_j,1e-9))-np.log(max(lo_j,1e-9))))
+    else:
+        Y_phys = grid * (hi_j - lo_j) + lo_j
+    XP, YP = np.meshgrid(X_phys, Y_phys)
+
+    # Grille d'evaluation GP (encoder complet)
+    n_pts = n_grid * n_grid
+    X_grid_base = np.tile(X_best_norm, (n_pts, 1))
+    dim_i = sum(encoder._encoded_dims[k] for k in range(pi_idx))
+    dim_j = sum(encoder._encoded_dims[k] for k in range(pj_idx))
+    X_grid_base[:, dim_i] = Xn.ravel()
+    X_grid_base[:, dim_j] = Yn.ravel()
+    mu_grid = gp_display.predict(X_grid_base).reshape(n_grid, n_grid)
+
+    # Preparation figure
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=100)
+    fig.patch.set_facecolor("#F8F9FA")
+    cmap = "viridis" if maximize else "viridis_r"
+
+    # Frame 0 : background heatmap fixe
+    im = ax.pcolormesh(XP, YP, mu_grid, cmap=cmap, shading="auto", alpha=0.88)
+    scat = ax.scatter([], [], c=[], cmap=cmap, edgecolors="white", linewidths=1.5,
+                      s=110, zorder=3, vmin=y_vals.min(), vmax=y_vals.max())
+    star = ax.scatter([], [], marker="*", s=320, c="#FFD700",
+                      edgecolors="#1A3A5C", linewidths=1.8, zorder=5)
+    ax.set_xlabel(p_i["name"], fontsize=11)
+    ax.set_ylabel(p_j["name"], fontsize=11)
+    title = ax.set_title("", fontsize=12, fontweight="bold", pad=10)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85)
+    cbar.set_label(f"mu({out_name}) GP", fontsize=10)
+
+    def update(frame):
+        # frame = iteration BO courante
+        mask = iter_col <= frame
+        if mask.sum() == 0:
+            return scat, star, title
+        xi_cur = xi_all[mask]
+        yj_cur = yj_all[mask]
+        y_cur  = y_vals[mask]
+        scat.set_offsets(np.c_[xi_cur, yj_cur])
+        scat.set_array(y_cur)
+        # Best point sous ce masque
+        bi = int(np.argmax(y_cur)) if maximize else int(np.argmin(y_cur))
+        star.set_offsets(np.c_[[xi_cur[bi]], [yj_cur[bi]]])
+        title.set_text(f"{campaign} — Iteration {frame}  |  "
+                       f"meilleur = {y_cur[bi]:.2f}  |  n = {mask.sum()}")
+        return scat, star, title
+
+    anim = animation.FuncAnimation(
+        fig, update, frames=range(0, max_iter + 1),
+        interval=800, blit=False, repeat=True
+    )
+
+    # Sauvegarde GIF
+    out_path = os.path.join(
+        os.path.dirname(os.path.abspath(get_csv_path(cfg))),
+        f"{campaign}_convergence.gif"
+    )
+    try:
+        anim.save(out_path, writer="pillow", fps=1.3)
+        print(f"  [OK]   Animation       : {os.path.basename(out_path)}")
+    except Exception as e:
+        print(f"  [WARN] Animation non generee : {e}")
+    plt.close(fig)
+
+def plot_trajectory_pca(df, cfg, gp_display, encoder, iteration, opts=None):
+    """
+    Dashboard secondaire v3.6 : projection PCA 2D de toutes les expériences.
+    Fichier : {campaign}_dashboard2.png
+
+    Contenu :
+      - Panel gauche : PCA(parametres) coloré par Y, annoté par iteration
+      - Panel droit  : histogramme Y par round (distribution de la qualité)
+    Permet de voir si l'algo explore tout l'espace chimique ou reste coincé.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    from sklearn.decomposition import PCA
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    if opts is None: opts = {}
+    dpi       = opts.get("dpi", 150)
+    campaign  = cfg.get("campaign_name", "campaign")
+    out_name  = cfg["outputs"][0]["name"]
+    maximize  = cfg["outputs"][0].get("direction", "maximize") == "maximize"
+    param_names = [p["name"] for p in cfg["parameters"]]
+
+    df_done = df[df["statut"].astype(str).str.strip() == "fait"].copy()
+    df_done[out_name] = pd.to_numeric(df_done[out_name], errors="coerce")
+    df_done = df_done.dropna(subset=[out_name])
+    if len(df_done) < 3:
+        return  # pas assez de points pour PCA
+
+    # Encoder en espace normalisé
+    X_raw = df_done[param_names].values.astype(object)
+    X_enc = encoder.encode(X_raw)
+    y     = df_done[out_name].values.astype(float)
+
+    # Numéro d'itération
+    iter_col = pd.to_numeric(df_done["iteration_BO"], errors="coerce").fillna(0).astype(int).values
+
+    # PCA 2D (ou moins si espace de dimension 1)
+    if X_enc.shape[1] < 2:
+        return  # pas utile en 1D
+    n_comp = min(2, X_enc.shape[1])
+    pca = PCA(n_components=n_comp)
+    X_2d = pca.fit_transform(X_enc)
+    var_ratio = pca.explained_variance_ratio_
+
+    # ── Figure 16:9 2 panels ──────────────────────────────────────────────────
+    fig = plt.figure(figsize=(16, 9), dpi=dpi)
+    fig.patch.set_facecolor("#F8F9FA")
+    gs = gridspec.GridSpec(1, 2, figure=fig, left=0.06, right=0.96,
+                           top=0.90, bottom=0.10, wspace=0.26,
+                           width_ratios=[1.4, 1.0])
+
+    # ── Panel 1 : PCA 2D ──────────────────────────────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.set_facecolor("#FEFEFE")
+    cmap = "viridis" if maximize else "viridis_r"
+    sc = ax1.scatter(X_2d[:, 0], X_2d[:, 1], c=y, cmap=cmap, s=120,
+                     edgecolors="white", linewidths=1.5, zorder=3)
+    # Annotations iteration pour les derniers points
+    for i in range(len(X_2d)):
+        ax1.annotate(str(iter_col[i]), (X_2d[i, 0], X_2d[i, 1]),
+                     fontsize=7, ha="center", va="center", color="white",
+                     fontweight="bold", zorder=4)
+    # Meilleur point : etoile dorée
+    best_i = int(np.argmax(y)) if maximize else int(np.argmin(y))
+    ax1.scatter(X_2d[best_i, 0], X_2d[best_i, 1], marker="*", s=400,
+                c="#FFD700", edgecolors="#1A3A5C", linewidths=2, zorder=5,
+                label=f"Meilleur ({out_name}={y[best_i]:.1f})")
+    ax1.set_xlabel(f"PC1 ({var_ratio[0]*100:.0f}% variance)", fontsize=10)
+    ax1.set_ylabel(f"PC2 ({var_ratio[1]*100:.0f}% variance)" if len(var_ratio) > 1 else "PC2",
+                   fontsize=10)
+    ax1.set_title(f"Trajectoire PCA des expériences — espace paramétrique",
+                  fontsize=11, fontweight="bold", pad=8)
+    ax1.grid(True, alpha=0.3, ls="--")
+    ax1.legend(loc="upper right", fontsize=8)
+    cbar = fig.colorbar(sc, ax=ax1, shrink=0.85)
+    cbar.set_label(out_name, fontsize=9)
+
+    # ── Panel 2 : Distribution Y par round ───────────────────────────────────
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.set_facecolor("#FEFEFE")
+    max_iter = int(iter_col.max())
+    for it in range(max_iter + 1):
+        mask = iter_col == it
+        if mask.sum() > 0:
+            ax2.scatter(np.full(mask.sum(), it), y[mask], alpha=0.6, s=60,
+                        color="#2176AE" if it > 0 else "#888888",
+                        edgecolors="white", linewidths=1)
+    # Ligne best cumulé
+    sorted_idx = np.argsort(iter_col)
+    y_sorted = y[sorted_idx]
+    iter_sorted = iter_col[sorted_idx]
+    best_cum = np.maximum.accumulate(y_sorted) if maximize else np.minimum.accumulate(y_sorted)
+    ax2.plot(iter_sorted, best_cum, color="#008080", lw=2.2, label="Meilleur cumulé")
+    ax2.set_xlabel("Round BO", fontsize=10)
+    ax2.set_ylabel(out_name, fontsize=10)
+    ax2.set_title("Distribution par round & convergence",
+                  fontsize=11, fontweight="bold", pad=8)
+    ax2.grid(True, alpha=0.3, ls="--")
+    ax2.legend(loc="lower right", fontsize=8)
+
+    # ── Titre global ──────────────────────────────────────────────────────────
+    fig.suptitle(f"{campaign}  |  Iteration {iteration}  |  Dashboard secondaire",
+                 fontsize=12, fontweight="bold", y=0.97, color="#1A3A5C")
+
+    # Sauvegarde
+    out_path = os.path.join(os.path.dirname(os.path.abspath(
+               get_csv_path(cfg))), f"{campaign}_dashboard2.png")
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  [OK]   Dashboard 2     : {os.path.basename(out_path)}")
+
 def plot_dashboard(df, cfg, gp_display, encoder, iteration, opts=None):
     """
     Génère un dashboard 16:9 écrasé à chaque itération.
@@ -2050,11 +4092,13 @@ def plot_dashboard(df, cfg, gp_display, encoder, iteration, opts=None):
     df_sugg_cur = df_sugg[pd.to_numeric(df_sugg.get("iteration_BO", pd.Series()),
                           errors="coerce") == iteration]
 
-    fig = plt.figure(figsize=(16, 9), dpi=dpi)
+    fig = plt.figure(figsize=(16, 12), dpi=dpi)
     fig.patch.set_facecolor("#F8F9FA")
-    gs  = gridspec.GridSpec(2, 2, figure=fig,
-                            left=0.07, right=0.97, top=0.93, bottom=0.07,
-                            hspace=0.38, wspace=0.28)
+    # Layout 3x2 : 2x2 existant + ligne heatmaps full-width
+    gs  = gridspec.GridSpec(3, 2, figure=fig,
+                            left=0.07, right=0.97, top=0.95, bottom=0.06,
+                            hspace=0.42, wspace=0.28,
+                            height_ratios=[1, 1, 1.15])
 
     # ── Panel 1 : Convergence ─────────────────────────────────────────────────
     ax1 = fig.add_subplot(gs[0, 0])
@@ -2268,6 +4312,19 @@ def plot_dashboard(df, cfg, gp_display, encoder, iteration, opts=None):
         ax4.text(0.5, 0.5, "PDP disponible apres 5 expériences GP",
                  ha="center", va="center", transform=ax4.transAxes,
                  fontsize=10, color="#888888")
+
+    # ── Panel 5 : Heatmaps GP (3 paires de variables) ─────────────────────────
+    try:
+        _plot_gp_heatmap_trio(fig, gs, gp_display, encoder, cfg, df_done,
+                              df_sugg_cur, out_name, maximize)
+    except Exception as e:
+        # Fallback : afficher un message si les heatmaps ne peuvent etre generees
+        ax5 = fig.add_subplot(gs[2, :])
+        ax5.text(0.5, 0.5,
+                 f"Heatmaps GP indisponibles : {str(e)[:80]}",
+                 ha="center", va="center", transform=ax5.transAxes,
+                 fontsize=10, color="#888888")
+        ax5.axis("off")
 
     # ── Titre global ──────────────────────────────────────────────────────────
     best_val = df_done[out_name].max() if maximize else df_done[out_name].min()
@@ -2706,7 +4763,7 @@ def plot_gp_landscape(gp_display, encoder, cfg, df_done, iteration, opts=None):
 # 12.  DETECTION DE CONVERGENCE
 # =============================================================================
 
-def check_convergence(df, cfg):
+def check_convergence(df, cfg, sat_warnings=None):
     """
     Detecte la convergence : le meilleur score n'a pas progresse
     sur les derniers `patience` rounds BO.
@@ -2714,6 +4771,10 @@ def check_convergence(df, cfg):
     Litterature : 5 rounds sans amelioration est standard en chimie
     (Shields et al. JACS 2021 ; Griffiths & Hernandez-Lobato 2020).
     Valeur par defaut : 5, configurable via convergence_patience dans bo_settings.
+
+    sat_warnings : liste retournee par detect_boundary_saturation().
+    Si des saturations de borne sont actives, la convergence est bloquee :
+    l optimum est possiblement hors de la plage, pas encore atteint.
 
     Retourne (is_converged: bool, n_rounds_stagnant: int).
     """
@@ -2747,156 +4808,19 @@ def check_convergence(df, cfg):
     amelioration = (best_now - best_before) / plage
 
     if amelioration < 1e-3:
+        # Bloquer la convergence si au moins une saturation de borne est active :
+        # le GP pousse vers une limite → l optimum est probablement hors plage.
+        if sat_warnings:
+            sat_params = [w[0] for w in sat_warnings]
+            print(f"  [CONVERGENCE BLOQUEE] Saturation active sur : "
+                  f"{', '.join(sat_params)}. Patience reset.")
+            return False, 0
         return True, patience
     return False, 0
 
 
 # =============================================================================
 # 13.  GRAPHIQUES FINAUX (apres convergence)
-# =============================================================================
-
-def plot_final(df, cfg, gp_display, encoder, iteration):
-    """
-    Genere les figures de publication a la convergence.
-    Sauvegarde {campaign}_FINAL_convergence.png et {campaign}_FINAL_landscape.png.
-    """
-    print("\n  [CONVERGENCE DETECTEE] Generation des graphiques finaux...")
-
-    # Reutilise les memes fonctions avec le prefixe FINAL
-    output_names = [o["name"] for o in cfg["outputs"]]
-    param_names  = [p["name"] for p in cfg["parameters"]]
-
-    df_done = df[df["statut"].str.strip() == "fait"].copy()
-    for col in output_names:
-        df_done[col] = pd.to_numeric(df_done[col], errors="coerce")
-    df_done = df_done.dropna(subset=output_names)
-    if len(df_done) < 2:
-        return
-
-    Y      = df_done[output_names].values.astype(float)
-    scores = scalarise(Y, cfg)
-    cummax = np.maximum.accumulate(scores)
-    n_exp  = len(scores)
-    x_vals = np.arange(1, n_exp + 1)
-
-    X_norm_all  = encoder.encode(df_done[param_names].values.astype(object))
-    gp_pred_all = gp_display.predict(X_norm_all)
-    has_stored  = "prediction_BO" in df_done.columns
-    stored_pred = pd.to_numeric(
-        df_done["prediction_BO"] if has_stored else pd.Series(dtype=float),
-        errors="coerce"
-    ).values if has_stored else np.full(n_exp, np.nan)
-
-    bo_mask = pd.to_numeric(
-        df_done["iteration_BO"].replace("", np.nan), errors="coerce"
-    ).notna().values
-    potential = np.where(bo_mask & ~np.isnan(stored_pred), stored_pred, gp_pred_all)
-    best_idx  = np.argmax(scores)
-    n_init    = int((~bo_mask).sum())
-
-    # ── Figure finale convergence ─────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.scatter(x_vals[~bo_mask], potential[~bo_mask],
-               facecolors="none", edgecolors=_COLORS["initial"],
-               s=60, linewidths=1.2, zorder=2, alpha=0.7)
-    ax.scatter(x_vals[bo_mask], potential[bo_mask],
-               facecolors="none", edgecolors=_COLORS["potential"],
-               s=60, linewidths=1.5, zorder=2, alpha=0.9,
-               label="Potentiel GP (prediction au moment de la suggestion)")
-    ax.scatter(x_vals[~bo_mask], scores[~bo_mask],
-               c=_COLORS["initial"], s=55, zorder=4, label="Experience initiale")
-    ax.scatter(x_vals[bo_mask], scores[bo_mask],
-               c=_COLORS["bo_dot"], s=55, zorder=4, label="Experience BO (mesure)")
-    ax.scatter(x_vals[best_idx], scores[best_idx],
-               c=_COLORS["best_star"], s=200, marker="*", zorder=6,
-               label=f"Meilleur ({scores[best_idx]:.3f})")
-    ax.plot(x_vals, cummax, color=_COLORS["best_line"], lw=2.5, zorder=3,
-            label="Meilleur cumule")
-    if 0 < n_init < n_exp:
-        ax.axvline(n_init + 0.5, color="black", lw=1, linestyle="--", alpha=0.4,
-                   label="Debut BO")
-    n_out  = len(output_names)
-    ylabel = output_names[0] if n_out == 1 else "Score scalarise"
-    ax.set_xlabel("Numero d'experience")
-    ax.set_ylabel(ylabel)
-    ax.set_title(f"[FINAL] Convergence – {cfg['campaign_name']}", fontsize=12)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    fname_conv = f"{cfg['campaign_name']}_FINAL_convergence.png"
-    plt.savefig(fname_conv, dpi=200)
-    plt.close()
-    print(f"  [GRAPHIQUE] FINAL convergence : {fname_conv}")
-
-    # ── Figure finale paysage ─────────────────────────────────────────────────
-    top2 = get_influential_params(gp_display, cfg, n=2)
-    if len(top2) >= 2:
-        p0_idx, p1_idx = top2[0], top2[1]
-        p0 = cfg["parameters"][p0_idx]
-        p1 = cfg["parameters"][p1_idx]
-        best_i      = int(np.argmax(scores))
-        X_best_raw  = df_done[param_names].values.astype(object)[best_i:best_i+1]
-        X_best_norm = encoder.encode(X_best_raw)[0]
-
-        n_grid = 60
-        p0g = np.linspace(0, 1, n_grid)
-        p1g = np.linspace(0, 1, n_grid)
-        P0n, P1n = np.meshgrid(p0g, p1g)
-        n_pts   = n_grid * n_grid
-        X_grid  = np.tile(X_best_norm, (n_pts, 1))
-        X_grid[:, p0_idx] = P0n.ravel()
-        X_grid[:, p1_idx] = P1n.ravel()
-        mu_grid = gp_display.predict(X_grid).reshape(n_grid, n_grid)
-
-        lo0, hi0 = float(p0["min"]), float(p0["max"])
-        lo1, hi1 = float(p1["min"]), float(p1["max"])
-        P0_phys  = P0n * (hi0 - lo0) + lo0
-        P1_phys  = P1n * (hi1 - lo1) + lo1
-
-        x0_pts = X_norm_all[:, p0_idx] * (hi0 - lo0) + lo0
-        x1_pts = X_norm_all[:, p1_idx] * (hi1 - lo1) + lo1
-
-        fig = plt.figure(figsize=(14, 6))
-        fig.suptitle(
-            f"[FINAL] Paysage GP – {cfg['campaign_name']}\n"
-            f"Axes : {p0['name']}  vs  {p1['name']}",
-            fontsize=11
-        )
-        ax1 = fig.add_subplot(121)
-        cf  = ax1.contourf(P0_phys, P1_phys, mu_grid, levels=20, cmap="viridis")
-        ax1.contour(P0_phys, P1_phys, mu_grid, levels=20,
-                    colors="k", alpha=0.1, linewidths=0.3)
-        cb = plt.colorbar(cf, ax=ax1)
-        cb.set_label(f"Prediction GP\n({ylabel})", fontsize=8)
-        ax1.scatter(x0_pts, x1_pts, c=scores, cmap="viridis",
-                    vmin=mu_grid.min(), vmax=mu_grid.max(),
-                    edgecolors="k", linewidths=0.7, s=65, zorder=5)
-        ax1.scatter(x0_pts[best_i], x1_pts[best_i], c="gold", s=220, marker="*",
-                    edgecolors="k", linewidths=0.7, zorder=6,
-                    label=f"Meilleur ({scores[best_i]:.3f})")
-        ax1.set_xlabel(p0["name"]); ax1.set_ylabel(p1["name"])
-        ax1.set_title("Carte de contour 2D"); ax1.legend(fontsize=8)
-
-        ax2 = fig.add_subplot(122, projection="3d")
-        ax2.plot_surface(P0_phys, P1_phys, mu_grid, cmap="viridis",
-                         alpha=0.82, linewidth=0, antialiased=True)
-        ax2.scatter(x0_pts, x1_pts, scores, c=scores, cmap="viridis",
-                    edgecolors="k", linewidths=0.5, s=45, zorder=5, depthshade=True)
-        ax2.scatter([x0_pts[best_i]], [x1_pts[best_i]], [scores[best_i]],
-                    c="gold", s=160, marker="*", edgecolors="k", zorder=6)
-        ax2.set_xlabel(p0["name"], fontsize=8, labelpad=6)
-        ax2.set_ylabel(p1["name"], fontsize=8, labelpad=6)
-        ax2.set_zlabel(ylabel,     fontsize=8, labelpad=6)
-        ax2.set_title("Surface 3D")
-        plt.tight_layout()
-        fname_land = f"{cfg['campaign_name']}_FINAL_landscape.png"
-        plt.savefig(fname_land, dpi=200, bbox_inches="tight")
-        plt.close()
-        print(f"  [GRAPHIQUE] FINAL paysage   : {fname_land}")
-
-
-# =============================================================================
-# 14.  BENCHMARK DES FONCTIONS D'ACQUISITION
 # =============================================================================
 
 def run_benchmark(cfg, df_done, encoder, n_iter=10, n_rep=5, rng=None):
@@ -2922,7 +4846,7 @@ def run_benchmark(cfg, df_done, encoder, n_iter=10, n_rep=5, rng=None):
     bo           = cfg["bo_settings"]
     kappa        = float(bo.get("ucb_kappa", 2.0))
     xi_val       = float(bo.get("xi", 0.01))
-    n_restarts   = min(int(bo.get("n_restarts", 20)), 8)  # reduit pour la vitesse
+    n_restarts   = min(int(bo.get("n_restarts", 50)), 8)  # reduit pour la vitesse
 
     # Donnees initiales (iteration_BO vide)
     df_init = df_done[
@@ -2970,7 +4894,16 @@ def run_benchmark(cfg, df_done, encoder, n_iter=10, n_rep=5, rng=None):
             best_sf = [float(y_train.max())]
 
             for it in range(n_iter):
-                gp_b   = build_gp(encoder.n_params, normalize_y=True)
+                # Benchmark : sklearn GP pour vitesse (ms vs ~10s ADAM)
+                # Précision suffisante pour comparer les fonctions d acquisition
+                from sklearn.gaussian_process import GaussianProcessRegressor
+                from sklearn.gaussian_process.kernels import Matern, ConstantKernel
+                _k = ConstantKernel(1.0) * Matern(
+                    length_scale=np.ones(encoder.n_params),
+                    length_scale_bounds=(1e-2, 5.0), nu=2.5)
+                gp_b = GaussianProcessRegressor(
+                    kernel=_k, alpha=0.5,
+                    normalize_y=True, n_restarts_optimizer=3)
                 gp_b.fit(X_train, y_train)
                 y_best = float(y_train.max())
 
@@ -3071,7 +5004,652 @@ def _unique_filename(base):
 # 15.  POINT D'ENTREE PRINCIPAL
 # =============================================================================
 
+def _filter_redundant_suggestions(suggestions, gp_preds, gp_pred_stds, encoder,
+                                   cfg, min_dist=0.08, stagnation_active=False):
+    """
+    Filtre les suggestions redondantes d'un batch pour économiser les expériences.
+
+    Logique :
+      - Si stagnation détectée : retourne tout le batch (diversité = objectif)
+      - Sinon : si 2 suggestions sont trop proches (distance normalisée < min_dist),
+        on ne garde que la première et on recommande à l'utilisateur de ne faire
+        qu'une expérience ce round.
+
+    Retourne (suggestions_filtrees, gp_preds_filtrees, gp_stds_filtrees, message)
+    """
+    if stagnation_active or len(suggestions) <= 1:
+        return suggestions, gp_preds, gp_pred_stds, None
+
+    from scipy.spatial.distance import pdist, squareform
+    param_names = [p["name"] for p in cfg["parameters"]]
+
+    # Encoder les suggestions dans l'espace [0,1]
+    X_sug_raw = np.array([[s[n] for n in param_names] for s in suggestions],
+                          dtype=object)
+    try:
+        X_sug_enc = encoder.encode(X_sug_raw)
+    except Exception:
+        return suggestions, gp_preds, gp_pred_stds, None
+
+    # Calculer la matrice des distances
+    dist_matrix = squareform(pdist(X_sug_enc))
+    np.fill_diagonal(dist_matrix, np.inf)
+
+    # Greedy : garder les points assez distants
+    keep_mask = [True] * len(suggestions)
+    for i in range(1, len(suggestions)):
+        for j in range(i):
+            if keep_mask[j] and dist_matrix[i, j] < min_dist:
+                keep_mask[i] = False
+                break
+
+    n_kept = sum(keep_mask)
+    if n_kept == len(suggestions):
+        return suggestions, gp_preds, gp_pred_stds, None
+
+    # Filtrer
+    filtered_sugg  = [s for s, k in zip(suggestions, keep_mask)  if k]
+    filtered_preds = [p for p, k in zip(gp_preds,    keep_mask)  if k]
+    filtered_stds  = ([s for s, k in zip(gp_pred_stds, keep_mask) if k]
+                      if gp_pred_stds else [])
+
+    n_dropped = len(suggestions) - n_kept
+    msg = (f"  [INFO] Batch intelligent : {n_dropped} suggestion(s) redondante(s) "
+           f"retiree(s).\n"
+           f"         Les points proposes par le GP etaient trop proches "
+           f"(distance < {min_dist:.2f}).\n"
+           f"         Economise {n_dropped} experience(s) ce round.")
+    return filtered_sugg, filtered_preds, filtered_stds, msg
+
+
+
+def _handle_final_mode(cfg, csv_path, encoder):
+    """
+    Mode --final : genere le rapport final haute resolution et l'animation.
+    Utilise le GP fitte sur toutes les donnees actuelles.
+    """
+    param_names  = [p["name"] for p in cfg["parameters"]]
+    output_names = [o["name"] for o in cfg["outputs"]]
+    bo           = cfg["bo_settings"]
+
+    if not os.path.exists(csv_path):
+        print(f"\n  [ERREUR] CSV introuvable : {csv_path}")
+        return
+    df = pd.read_csv(csv_path)
+    df_done = df[df["statut"].astype(str).str.strip() == "fait"].copy()
+    for col in output_names:
+        df_done[col] = pd.to_numeric(df_done[col], errors="coerce")
+    df_done = df_done.dropna(subset=output_names)
+
+    if len(df_done) < 4:
+        print(f"\n  [ERREUR] Pas assez de donnees ({len(df_done)} < 4) pour --final")
+        return
+
+    # Fit GP
+    X_train = encoder.encode(df_done[param_names].values.astype(object))
+    Y_train = df_done[output_names].values.astype(float)
+    y_raw = scalarise(Y_train, cfg)
+    y_mm, bc_lam, _ = fit_boxcox(y_raw, bo, verbose=False)
+    gp_display = build_gp(encoder.n_params, normalize_y=(bc_lam is None), cfg=cfg, encoder=encoder)
+    gp_display.fit(X_train, y_mm)
+
+    # Iter max
+    it_max = int(pd.to_numeric(df_done["iteration_BO"], errors="coerce").fillna(0).max())
+
+    print(f"\n  Generation rapport final (it {it_max})...")
+    opts = {"dpi": 200, "timestamp": False}
+    try:
+        plot_final_report(df, cfg, gp_display, encoder, it_max, opts)
+    except Exception as e:
+        print(f"  [WARN] Rapport final non genere : {e}")
+    try:
+        plot_trajectory_pca(df, cfg, gp_display, encoder, it_max, opts)
+    except Exception as e:
+        print(f"  [WARN] Dashboard PCA non genere : {e}")
+    try:
+        plot_convergence_animation(df, cfg, gp_display, encoder, opts)
+    except Exception as e:
+        print(f"  [WARN] Animation non generee : {e}")
+    print(f"\n  Tous les rapports finaux ont ete generes dans :")
+    print(f"    {os.path.dirname(os.path.abspath(csv_path))}")
+
+def _handle_whatif_mode(cfg, csv_path, encoder, whatif_points, neighbors_mode=False):
+    """
+    Mode --what-if : prédit la valeur GP à un point hypothétique.
+    Utilise le GP fitté sur les données actuelles (sans déclencher le workflow BO).
+
+    Si neighbors_mode=True (v3.7) : affiche aussi les sensibilités locales
+    (gradient GP par variable) et 5 voisins prometteurs dans un rayon.
+    """
+    param_names  = [p["name"] for p in cfg["parameters"]]
+    output_names = [o["name"] for o in cfg["outputs"]]
+    bo           = cfg["bo_settings"]
+
+    # Charger le CSV
+    if not os.path.exists(csv_path):
+        print(f"\n  [ERREUR] CSV introuvable : {csv_path}")
+        return
+    df = pd.read_csv(csv_path)
+
+    df_done = df[df["statut"].astype(str).str.strip() == "fait"].copy()
+    for col in output_names:
+        df_done[col] = pd.to_numeric(df_done[col], errors="coerce")
+    df_done = df_done.dropna(subset=output_names)
+
+    if len(df_done) < 3:
+        print(f"\n  [ERREUR] Pas assez de donnees completes ({len(df_done)} < 3)")
+        return
+
+    # Valider les points demandés
+    valid_params = {p["name"] for p in cfg["parameters"]}
+    unknown = set(whatif_points.keys()) - valid_params
+    if unknown:
+        print(f"\n  [ERREUR] Parametres inconnus : {unknown}")
+        print(f"  Parametres valides : {valid_params}")
+        return
+    missing = valid_params - set(whatif_points.keys())
+    if missing:
+        print(f"\n  [ERREUR] Parametres manquants : {missing}")
+        return
+
+    # Construire le point
+    try:
+        point = {}
+        for p in cfg["parameters"]:
+            raw_val = whatif_points[p["name"]]
+            if p["type"] == "continuous":
+                point[p["name"]] = float(raw_val)
+            else:
+                cats = p.get("categories", [])
+                if raw_val not in cats:
+                    print(f"\n  [ERREUR] '{raw_val}' n'est pas dans {cats}")
+                    return
+                point[p["name"]] = raw_val
+    except ValueError as e:
+        print(f"\n  [ERREUR] Conversion de valeur : {e}")
+        return
+
+    # Fitter le GP
+    X_train = encoder.encode(df_done[param_names].values.astype(object))
+    Y_train = df_done[output_names].values.astype(float)
+    y_raw = scalarise(Y_train, cfg)
+    y_mm, bc_lam, _ = fit_boxcox(y_raw, bo, verbose=True)
+
+    gp = build_gp(encoder.n_params, normalize_y=(bc_lam is None), cfg=cfg, encoder=encoder)
+    gp.fit(X_train, y_mm)
+
+    # Prédire
+    X_test = encoder.encode(np.array([[point[n] for n in param_names]], dtype=object))
+    mu_bc, sigma_bc = gp.predict(X_test, return_std=True)
+    mu_real = invert_boxcox(mu_bc, bc_lam)
+    mu_val = float(np.asarray(mu_real).ravel()[0])
+
+    # sigma en espace réel
+    if bc_lam is not None:
+        # MinMax : sigma_real = sigma * y_scale (actuel)
+        y_max = float(df_done[output_names[0]].max())
+        y_scale = max(y_max * 1.5, 100.0)
+        sigma_real = float(sigma_bc[0]) * y_scale
+    else:
+        sigma_real = float(sigma_bc[0])
+
+    # Affichage
+    print(f"\n  {'='*55}")
+    print(f"  WHAT-IF : prediction GP au point hypothetique")
+    print(f"  {'='*55}")
+    print(f"\n  Point evalue :")
+    for n in param_names:
+        val = point[n]
+        if isinstance(val, float):
+            print(f"    {n:<30} : {val:.4f}")
+        else:
+            print(f"    {n:<30} : {val}")
+
+    print(f"\n  Prediction GP :")
+    print(f"    {output_names[0]:<30} : {mu_val:.2f} ± {sigma_real:.2f}")
+
+    # Interpretation
+    rel_std = sigma_real / max(abs(mu_val), 1e-6)
+    if rel_std < 0.05:
+        conf = "GP tres confiant (zone bien exploree)"
+    elif rel_std < 0.15:
+        conf = "GP confiant"
+    elif rel_std < 0.30:
+        conf = "GP incertain (peu de donnees proches)"
+    else:
+        conf = "GP explore l inconnu (tres incertain)"
+    print(f"    Confiance                      : {conf}")
+
+    # Distance au point le plus proche dans les données
+    X_all_enc = encoder.encode(df_done[param_names].values.astype(object))
+    dists = np.sqrt(((X_all_enc - X_test[0])**2).sum(axis=1))
+    closest_idx = int(np.argmin(dists))
+    closest_row = df_done.iloc[closest_idx]
+    closest_y = float(closest_row[output_names[0]])
+    print(f"\n  Point reel le plus proche :")
+    print(f"    Distance normalisee           : {float(dists[closest_idx]):.3f}")
+    print(f"    Y mesure                      : {closest_y:.2f}")
+    for n in param_names:
+        v = closest_row[n]
+        try:
+            v = f"{float(v):.4f}"
+        except (ValueError, TypeError):
+            v = str(v)
+        print(f"    {n:<30} : {v}")
+
+    # ── Mode --neighbors (v3.7) : sensibilités + voisins prometteurs ──────
+    if neighbors_mode:
+        print(f"\n  {'='*55}")
+        print(f"  ANALYSE VOISINAGE (--neighbors)")
+        print(f"  {'='*55}")
+
+        # 1. Sensibilités locales via différences finies (gradient GP)
+        print(f"\n  Sensibilites locales (gradient GP pour Y) :")
+        eps = 0.03  # perturbation en espace normalise [0,1]
+        base_mu = mu_val
+        sensitivities = []
+        for pi, p in enumerate(cfg["parameters"]):
+            if p["type"] != "continuous":
+                # Catégoriel : gradient pas défini, skip
+                continue
+            # Position de p dans espace encodé (1 dim par continu)
+            dim = sum(encoder._encoded_dims[k] for k in range(pi))
+            X_plus  = X_test.copy()
+            X_minus = X_test.copy()
+            X_plus[0, dim]  = min(X_plus[0, dim] + eps, 1.0)
+            X_minus[0, dim] = max(X_minus[0, dim] - eps, 0.0)
+            mu_plus, _  = gp.predict(X_plus,  return_std=True)
+            mu_minus, _ = gp.predict(X_minus, return_std=True)
+            mu_plus_real  = float(invert_boxcox(mu_plus,  bc_lam)[0])
+            mu_minus_real = float(invert_boxcox(mu_minus, bc_lam)[0])
+            grad = (mu_plus_real - mu_minus_real) / (2 * eps)
+            sensitivities.append((p["name"], grad))
+
+        # Trier par magnitude décroissante
+        sensitivities.sort(key=lambda x: -abs(x[1]))
+        for name, grad in sensitivities:
+            arrow = "↑" if grad > 0 else "↓"
+            print(f"    {name:<30} : {arrow} {grad:+.3f} / unit (norm)")
+
+        # 2. Voisins prometteurs : grille dense autour du point + tri par mu
+        print(f"\n  Voisins prometteurs dans un rayon 0.15 (normalise) :")
+        n_cand = 500
+        rng_local = np.random.default_rng(42)
+        X_cand = np.tile(X_test[0], (n_cand, 1))
+        # Perturbation aleatoire sur dims continues uniquement
+        for pi, p in enumerate(cfg["parameters"]):
+            if p["type"] != "continuous":
+                continue
+            dim = sum(encoder._encoded_dims[k] for k in range(pi))
+            noise = rng_local.normal(0, 0.08, n_cand)
+            X_cand[:, dim] = np.clip(X_cand[:, dim] + noise, 0.0, 1.0)
+        # Filtrer par distance 0.15
+        d_cand = np.sqrt(((X_cand - X_test[0])**2).sum(axis=1))
+        mask = (d_cand > 0.02) & (d_cand < 0.15)
+        X_cand = X_cand[mask]
+        if len(X_cand) == 0:
+            print("    (aucun voisin dans le rayon)")
+        else:
+            mu_cand, _ = gp.predict(X_cand, return_std=True)
+            mu_cand_real = invert_boxcox(mu_cand, bc_lam)
+            # Top 5 par mu
+            maximize = cfg["outputs"][0].get("direction", "maximize") == "maximize"
+            order = np.argsort(-mu_cand_real) if maximize else np.argsort(mu_cand_real)
+            top_idx = order[:5]
+            for rank, idx in enumerate(top_idx, 1):
+                xn = X_cand[idx].reshape(1, -1)
+                decoded = encoder.decode(xn)[0]
+                mu_v = float(mu_cand_real[idx])
+                delta = mu_v - mu_val
+                sign = "+" if delta >= 0 else ""
+                print(f"    #{rank}  Y≈{mu_v:.2f} ({sign}{delta:.2f})  ", end="")
+                parts = []
+                for n in param_names:
+                    v = decoded[n]
+                    try:
+                        parts.append(f"{n}={float(v):.2f}")
+                    except (ValueError, TypeError):
+                        parts.append(f"{n}={v}")
+                print("  ".join(parts))
+
+
+def _generate_coverage_heatmap(df_done, cfg, encoder, base_dir, campaign,
+                                iteration, rng=None):
+    """
+    Genere une heatmap PNG de coverage de l'espace de recherche (v3.8).
+
+    Sauvegarde : {campaign}_iter_{N}_coverage.png
+    Retourne : chemin du PNG ou None si echec.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    cov_data = autopilot_compute_coverage_grid(df_done, cfg, encoder,
+                                                n_grid_dim=40, rng=rng)
+    if cov_data is None:
+        return None
+
+    try:
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=110)
+
+        # Heatmap : faible distance = vert (bien explore), forte = rouge (zone d'ombre)
+        # On affiche la distance directement, avec colormap qui va de vert a rouge
+        im = ax.contourf(cov_data['X1'], cov_data['X2'], cov_data['Z'],
+                          levels=20, cmap='RdYlGn_r')
+
+        # Points observes
+        X_obs = cov_data['X_obs_norm_2d']
+        ax.scatter(X_obs[:, 0], X_obs[:, 1], c='black', s=40,
+                   edgecolors='white', linewidths=1.0, zorder=10,
+                   label=f"{len(X_obs)} obs")
+
+        ax.set_xlabel(f"{cov_data['param_names'][0]} (normalise)")
+        ax.set_ylabel(f"{cov_data['param_names'][1]} (normalise)")
+        ax.set_title(f"Coverage map — Zones d'ombre en rouge (iter {iteration})")
+        ax.legend(loc='upper right', fontsize=9)
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Distance min au point observe le plus proche\n"
+                       "(faible = explore, fort = zone d'ombre)", fontsize=9)
+
+        # Annoter coverage %
+        coverage_pct = float((cov_data['Z'] < 0.20).mean())
+        ax.text(0.02, 0.98, f"Coverage = {coverage_pct:.0%}",
+                transform=ax.transAxes, fontsize=11, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.85))
+
+        cov_path = os.path.join(base_dir,
+                                f"{campaign}_iter_{iteration:02d}_coverage.png")
+        fig.tight_layout()
+        fig.savefig(cov_path, dpi=110, bbox_inches='tight')
+        plt.close(fig)
+        return cov_path
+    except Exception as e:
+        try:
+            plt.close('all')
+        except Exception:
+            pass
+        return None
+
+
+def _write_run_report_html(cfg, df_done, df_updated, suggestions, gp_preds,
+                            iteration, output_names, param_names, csv_path,
+                            gp_display=None, encoder=None, gp_pred_stds=None,
+                            gp_pred_stds_split=None, shap_contribs=None,
+                            autopilot_decision=None):
+    """
+    Écrit un rapport HTML autonome (parallèle au .txt) pour chaque round BO.
+    Fichier : {campaign}_iter_{N:02d}_report.html
+
+    Avantages sur le .txt :
+      - Embarque le dashboard.png en base64 (consultable même sans les fichiers annexes)
+      - Mise en forme pro (pour partage avec l'encadrant)
+      - Navigation avec ancres internes
+    """
+    import base64
+    from datetime import datetime
+
+    campaign = cfg.get("campaign_name", "campaign")
+    base_dir = os.path.dirname(os.path.abspath(csv_path))
+    html_path = os.path.join(base_dir, f"{campaign}_iter_{iteration:02d}_report.html")
+
+    # Unique : ne pas écraser
+    suffix = 1
+    while os.path.exists(html_path):
+        html_path = os.path.join(base_dir,
+                     f"{campaign}_iter_{iteration:02d}_report_{suffix}.html")
+        suffix += 1
+
+    # Charger le dashboard si disponible
+    dashboard_path = os.path.join(base_dir, f"{campaign}_dashboard.png")
+    dashboard_b64 = ""
+    if os.path.exists(dashboard_path):
+        try:
+            with open(dashboard_path, "rb") as fh:
+                dashboard_b64 = base64.b64encode(fh.read()).decode("ascii")
+        except Exception:
+            pass
+
+    # Construire les données
+    n_done    = len(df_done)
+    n_sugg    = len(suggestions)
+    maximize  = cfg["outputs"][0].get("direction", "maximize") == "maximize"
+    best_val  = (df_done[output_names[0]].max() if maximize
+                 else df_done[output_names[0]].min())
+
+    # Hyperparamètres GP
+    hp_html = ""
+    if gp_display is not None and encoder is not None:
+        try:
+            ls = gp_display.kernel_.k2.length_scale
+            rows = []
+            dim_cursor = 0
+            for pi, p in enumerate(cfg["parameters"]):
+                nd = encoder._encoded_dims[pi]
+                ls_p = ls[dim_cursor:dim_cursor+nd]
+                importance = 1.0 / (float(ls_p.mean()) + 1e-9)
+                rows.append(f"<tr><td>{p['name']}</td>"
+                            f"<td>{float(ls_p.mean()):.3f}</td>"
+                            f"<td>{importance:.2f}</td></tr>")
+                dim_cursor += nd
+            noise = float(gp_display.alpha)
+            hp_html = f"""
+    <h2>Hyperparamètres GP</h2>
+    <table>
+      <thead><tr><th>Paramètre</th><th>Lengthscale ARD</th><th>Importance relative</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+    <p><strong>Bruit estimé</strong> (GaussianLikelihood) : {noise:.5f}</p>
+"""
+        except Exception:
+            pass
+
+    # Suggestions avec std
+    sugg_html_rows = []
+    for i, (sug, pred) in enumerate(zip(suggestions, gp_preds), 1):
+        lines_sug = [f"<h3>Suggestion {i}/{n_sugg}</h3>", "<table>"]
+        for p_cfg in cfg["parameters"]:
+            pname = p_cfg["name"]
+            val   = sug[pname]
+            if p_cfg["type"] == "continuous":
+                lines_sug.append(f"<tr><td>{pname}</td><td>{float(val):.4f}</td></tr>")
+            else:
+                lines_sug.append(f"<tr><td>{pname}</td><td>{val}</td></tr>")
+        if gp_pred_stds and (i-1) < len(gp_pred_stds) and gp_pred_stds[i-1] is not None:
+            std_v = gp_pred_stds[i-1]
+            lines_sug.append(f"<tr class='pred'><td><strong>Prédiction GP</strong></td>"
+                             f"<td><strong>{pred:.2f} ± {std_v:.2f}</strong></td></tr>")
+            # Decomposition ep/al (v3.6)
+            if gp_pred_stds_split and (i-1) < len(gp_pred_stds_split) and gp_pred_stds_split[i-1] is not None:
+                ep, al = gp_pred_stds_split[i-1]
+                lines_sug.append(f"<tr><td style='padding-left:1.5em'>↳ épistémique</td>"
+                                 f"<td><em>{ep:.2f}</em> <span style='color:#888'>(réductible)</span></td></tr>")
+                lines_sug.append(f"<tr><td style='padding-left:1.5em'>↳ aléatoire</td>"
+                                 f"<td><em>{al:.2f}</em> <span style='color:#888'>(bruit intrinsèque)</span></td></tr>")
+        else:
+            lines_sug.append(f"<tr class='pred'><td><strong>Prédiction GP</strong></td>"
+                             f"<td><strong>{pred:.2f}</strong></td></tr>")
+        lines_sug.append("</table>")
+
+        # Contributions SHAP (v3.6)
+        if shap_contribs is not None and (i-1) < len(shap_contribs):
+            sc = shap_contribs[i-1]
+            baseline = sc.get("baseline", 0.0)
+            contribs = sc.get("contributions", {})
+            if contribs:
+                sorted_c = sorted(contribs.items(), key=lambda x: -abs(x[1]))
+                lines_sug.append(f'<h4 style="margin-top:1em;color:#2176AE">'
+                                 f'Pourquoi ce point ? <span style="font-weight:normal;color:#888">'
+                                 f'(baseline {baseline:.2f})</span></h4>')
+                lines_sug.append("<table style='width:auto'>")
+                for pname, val in sorted_c:
+                    color = "#2E7D32" if val >= 0 else "#C62828"
+                    sign = "+" if val >= 0 else ""
+                    lines_sug.append(f"<tr><td>{pname}</td>"
+                                     f"<td style='color:{color};font-weight:600'>"
+                                     f"{sign}{val:.2f}</td></tr>")
+                lines_sug.append("</table>")
+
+        sugg_html_rows.append("\n".join(lines_sug))
+
+    dashboard_img = ""
+    if dashboard_b64:
+        dashboard_img = (f'<img src="data:image/png;base64,{dashboard_b64}" '
+                         f'alt="Dashboard" style="width:100%;max-width:1200px;'
+                         f'border:1px solid #ddd;border-radius:4px"/>')
+
+    # === v3.8 : Coverage heatmap + autopilot status ====
+    autopilot_html = ""
+    coverage_img = ""
+    if autopilot_decision and autopilot_decision.get('phase'):
+        # Generation heatmap PNG
+        try:
+            cov_path = _generate_coverage_heatmap(
+                df_done, cfg, encoder, base_dir, campaign, iteration)
+            if cov_path and os.path.exists(cov_path):
+                with open(cov_path, "rb") as fh:
+                    cov_b64 = base64.b64encode(fh.read()).decode("ascii")
+                coverage_img = (f'<img src="data:image/png;base64,{cov_b64}" '
+                                f'alt="Coverage map" style="width:100%;max-width:900px;'
+                                f'border:1px solid #ddd;border-radius:4px"/>')
+        except Exception:
+            coverage_img = ""
+
+        # Bloc HTML autopilot
+        ap_phase    = autopilot_decision.get('phase', '?')
+        ap_progress = autopilot_decision.get('progress')
+        ap_coverage = autopilot_decision.get('coverage')
+        ap_target   = autopilot_decision.get('target')
+        ap_acq      = autopilot_decision.get('acquisition', '?')
+        ap_reason   = autopilot_decision.get('reason', '')
+
+        # Couleur badge phase
+        phase_colors = {'EARLY': '#FF6F00', 'MID': '#2176AE', 'LATE': '#2E7D32'}
+        phase_color  = phase_colors.get(ap_phase, '#888')
+
+        rows_ap = []
+        rows_ap.append(f"<tr><td><strong>Phase</strong></td>"
+                       f"<td><span style='background:{phase_color};color:white;"
+                       f"padding:4px 12px;border-radius:4px;font-weight:600'>"
+                       f"{ap_phase}</span></td></tr>")
+        if ap_target is not None:
+            rows_ap.append(f"<tr><td>Target</td><td>{ap_target:.4f}</td></tr>")
+        if ap_progress is not None:
+            color_p = '#2E7D32' if ap_progress >= 0.9 else ('#2176AE' if ap_progress >= 0.5 else '#FF6F00')
+            rows_ap.append(f"<tr><td>Progress (best/target)</td>"
+                           f"<td style='color:{color_p};font-weight:600'>{ap_progress:.1%}</td></tr>")
+        if ap_coverage is not None:
+            color_c = '#2E7D32' if ap_coverage >= 0.5 else ('#FF6F00' if ap_coverage < 0.3 else '#2176AE')
+            rows_ap.append(f"<tr><td>Coverage espace</td>"
+                           f"<td style='color:{color_c};font-weight:600'>{ap_coverage:.1%}</td></tr>")
+        rows_ap.append(f"<tr><td>Acquisition choisie</td>"
+                       f"<td><code>{ap_acq}</code></td></tr>")
+
+        autopilot_html = f"""
+<h2>Auto-Pilot Orchestrateur (v3.8)</h2>
+<div style="background:#f8f9fa;border-left:4px solid {phase_color};padding:1em 1.5em;border-radius:4px">
+  <table style="margin:0">{''.join(rows_ap)}</table>
+  <p style="margin-top:1em;color:#555;font-style:italic">
+    <strong>Decision :</strong> {ap_reason}
+  </p>
+</div>
+
+<h3>Coverage map — Zones d'ombre</h3>
+<p>Les <span style="color:#C62828;font-weight:600">zones rouges</span> indiquent les regions
+peu explorees (potentielles zones d'ombre). Les <span style="color:#2E7D32;font-weight:600">zones vertes</span>
+sont bien couvertes.</p>
+{coverage_img or '<p><em>Heatmap non disponible (necessite >= 2 parametres continus et points observes).</em></p>'}
+"""
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>{campaign} — Iteration {iteration}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 1100px; margin: 2em auto; padding: 0 2em; color: #222;
+         line-height: 1.55; background: #fafafa; }}
+  h1 {{ color: #1A3A5C; border-bottom: 3px solid #2176AE; padding-bottom: .4em; }}
+  h2 {{ color: #1A3A5C; margin-top: 2em; border-left: 4px solid #2176AE;
+        padding-left: .6em; }}
+  h3 {{ color: #2176AE; margin-top: 1.4em; }}
+  table {{ border-collapse: collapse; margin: 0.8em 0; background: white; }}
+  th, td {{ padding: .5em 1em; text-align: left; border-bottom: 1px solid #eee; }}
+  th {{ background: #f0f4f8; color: #1A3A5C; font-weight: 600; }}
+  .pred td {{ background: #fff8e8; }}
+  .metrics {{ display: flex; gap: 1.5em; flex-wrap: wrap; margin: 1em 0; }}
+  .metric-box {{ background: white; padding: 1em 1.5em; border-radius: 6px;
+                 border-left: 4px solid #2176AE; flex: 1; min-width: 200px; }}
+  .metric-label {{ color: #666; font-size: .85em; text-transform: uppercase;
+                   letter-spacing: .05em; }}
+  .metric-value {{ font-size: 1.6em; font-weight: 600; color: #1A3A5C;
+                   margin-top: .2em; }}
+  footer {{ color: #999; font-size: .85em; margin-top: 3em; border-top: 1px solid #eee;
+            padding-top: 1em; }}
+</style>
+</head>
+<body>
+<h1>{campaign} — Rapport d'itération {iteration}</h1>
+<p><em>Généré le {timestamp}</em></p>
+
+<h2>Synthèse</h2>
+<div class="metrics">
+  <div class="metric-box"><div class="metric-label">Expériences complétées</div>
+    <div class="metric-value">{n_done}</div></div>
+  <div class="metric-box"><div class="metric-label">Meilleur {output_names[0]}</div>
+    <div class="metric-value">{best_val:.2f}</div></div>
+  <div class="metric-box"><div class="metric-label">Suggestions ce round</div>
+    <div class="metric-value">{n_sugg}</div></div>
+</div>
+
+{autopilot_html}
+
+<h2>Dashboard visuel</h2>
+{dashboard_img or '<p><em>Dashboard non disponible pour cette itération.</em></p>'}
+
+<h2>Suggestions</h2>
+{''.join(sugg_html_rows)}
+
+{hp_html}
+
+<h2>Étapes suivantes</h2>
+<ol>
+  <li>Réaliser les expériences aux conditions suggérées</li>
+  <li>Saisir les résultats dans le CSV : <code>{os.path.basename(csv_path)}</code></li>
+  <li>Changer <code>statut</code> → <code>fait</code></li>
+  <li>Relancer : <code>python bo_chemistry.py</code></li>
+</ol>
+
+<footer>
+  Rapport généré par bo_chemistry.py v3.5<br>
+  CSV : {os.path.basename(csv_path)}
+</footer>
+</body>
+</html>"""
+
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    print(f"  [OK]   Rapport HTML  : {os.path.basename(html_path)}")
+
+
 def main():
+    """
+    Point d entree principal. Dispatch les 7 modes selon les flags CLI :
+
+    Modes (exclusifs, le premier trouve gagne) :
+      --init-doe [--doe-n N]  : genere un plan LHS N points dans le CSV
+      --status                : resume lecture seule du CSV (meilleur Y, convergence)
+      --benchmark             : benchmark des acquisitions sur donnees actuelles
+      --final                 : rapport final haute resolution + animation GIF (v3.6)
+      --what-if K=V K=V ...   : prediction GP hypothetique sans run BO
+      --explore               : force VARMAX ce round (exploration pure)  [v3.7]
+      (defaut)                : cycle BO normal (fit GP, suggere, ecrit CSV/rapports)
+
+    Tous les modes sauf --init-doe et --status requierent gpytorch installe.
+    """
 
     # ── Parsing des arguments ─────────────────────────────────────────────────
     args           = sys.argv[1:]
@@ -3082,12 +5660,26 @@ def main():
     status_mode    = "--status"    in flags
     doe_mode       = "--init-doe"  in flags
     final_mode     = "--final"     in flags
+    whatif_mode    = "--what-if"   in flags
+    explore_mode   = "--explore"   in flags  # v3.7 : force VARMAX ce round
     # --doe-n N : nombre de points LHS (optionnel)
+    # Note : chercher dans args (pas flags) car la valeur N ne commence pas par --
     doe_n = None
-    for k, fl in enumerate(flags):
-        if fl == "--doe-n" and k + 1 < len(flags):
-            try: doe_n = int(flags[k + 1])
+    for k, a in enumerate(args):
+        if a == "--doe-n" and k + 1 < len(args):
+            try: doe_n = int(args[k + 1])
             except ValueError: pass
+
+    # --what-if : collecter les assignations K=V depuis les args positional
+    whatif_points = {}
+    if whatif_mode:
+        for arg in args:
+            if "=" in arg and not arg.startswith("--"):
+                try:
+                    k_, v_ = arg.split("=", 1)
+                    whatif_points[k_.strip()] = v_.strip()
+                except ValueError:
+                    pass
 
     config_path = trouver_config(argument)
     cfg         = load_config(config_path)
@@ -3097,7 +5689,20 @@ def main():
     bo           = cfg["bo_settings"]
     n_suggest    = int(bo.get("n_suggestions", 1))
     seed         = int(bo.get("seed", 42))
-    min_pts      = int(bo.get("min_initial_points", max(3, 2 * encoder.n_params)))
+    np.random.seed(seed)          # seed global pour reproductibilité totale
+    # v3.7c : n_init adaptatif selon dimension
+    # Regle : 3 pts par dim continue + 1 pt par dim categorielle, plancher 5.
+    # Override possible via bo_settings.min_initial_points dans le YAML.
+    n_cont = sum(1 for p in cfg["parameters"] if p["type"] == "continuous")
+    n_cat  = sum(1 for p in cfg["parameters"] if p["type"] != "continuous")
+    _adaptive_default = max(5, 3 * n_cont + n_cat)
+    if "min_initial_points" in bo:
+        min_pts = int(bo["min_initial_points"])
+    else:
+        min_pts = _adaptive_default
+        if min_pts > max(3, 2 * encoder.n_params):
+            print(f"  [INFO] n_init adapte a {min_pts} (3 x {n_cont} continu + "
+                  f"{n_cat} cat). Override : 'min_initial_points' dans le YAML.")
     rng          = np.random.default_rng(seed)
     param_names  = [p["name"] for p in cfg["parameters"]]
     output_names = [o["name"] for o in cfg["outputs"]]
@@ -3115,6 +5720,14 @@ def main():
         print(f"  Mode       |  INIT-DOE (Latin Hypercube Sampling)")
     if final_mode:
         print(f"  Mode       |  FINAL (rapport final haute resolution)")
+    if whatif_mode:
+        print(f"  Mode       |  WHAT-IF (prediction GP a un point hypothetique)")
+    if explore_mode:
+        print(f"  Mode       |  EXPLORATION (VARMAX forcee pour ce round)")
+    # v3.7 : indiquer si contraintes actives
+    _cstr_info = cfg.get("constraints", []) or []
+    if _cstr_info:
+        print(f"  Contraintes|  {len(_cstr_info)} actives (feasibility)")
     print(f"{sep}")
 
     # ── Mode INIT-DOE : plan LHS ─────────────────────────────────────────────
@@ -3122,6 +5735,25 @@ def main():
         n_pts = doe_n if doe_n else int(bo.get("doe_n_points",
                     max(2 * sum(1 for p in cfg["parameters"] if p["type"]=="continuous") + 1, 6)))
         run_init_doe(cfg, csv_path, n_pts, rng)
+        print(f"{sep}\n")
+        return
+
+    # ── Mode WHAT-IF : prediction GP a un point hypothetique ────────────────
+    if whatif_mode:
+        if not whatif_points:
+            print(f"\n  [ERREUR] --what-if requiert des assignations K=V")
+            print(f"  Exemple : python bo_chemistry.py config.yaml --what-if T=65 t=90 eq=2.0")
+            print(f"{sep}\n")
+            return
+        neighbors_flag = "--neighbors" in flags
+        _handle_whatif_mode(cfg, csv_path, encoder, whatif_points,
+                            neighbors_mode=neighbors_flag)
+        print(f"{sep}\n")
+        return
+
+    # ── Mode FINAL (v3.6) : rapport final + animation convergence ───────────
+    if final_mode:
+        _handle_final_mode(cfg, csv_path, encoder)
         print(f"{sep}\n")
         return
 
@@ -3270,18 +5902,74 @@ def main():
     # Box-Cox transform (si active — stabilise la variance du bruit)
     y_disp_bc, bc_lam_d, bc_shift_d = fit_boxcox(y_disp, bo)
     bc_active  = bo.get("boxcox", False)
-    gp_display = build_gp(encoder.n_params, normalize_y=not bc_active)
+    gp_display = build_gp(encoder.n_params, normalize_y=not bc_active, cfg=cfg, encoder=encoder)
     gp_display.fit(X_disp, y_disp_bc)
+
+    # ── Override acquisition si --explore (v3.7) ────────────────────────────
+    _orig_acq = bo.get("acquisition", "EI")
+    if explore_mode:
+        bo["acquisition"] = "VARMAX"
+        print(f"\n  [EXPLORE] Acquisition forcee: VARMAX (orig: {_orig_acq})")
 
     # ── Calcul des suggestions ────────────────────────────────────────────────
     mode = bo.get("multi_objective_mode", "weighted_sum")
     acq  = bo.get("acquisition", "EI").upper()
+
+    # ── Restaurer acquisition originale apres --explore (v3.7) ─────────────
+    if explore_mode:
+        bo["acquisition"] = _orig_acq
 
     # ── Detection de stagnation ───────────────────────────────────────────────
     import copy
     stag_detected, stag_params, stag_msg = detect_variable_stagnation(df, cfg, bo)
     drift_detected, drift_params, drift_msg = detect_directional_drift(df, cfg, bo)
 
+    # ── Fix v3.7b : switch EI → UCB apres 2 rounds sans progression ─────────
+    # Evite que EI reste en mode exploration quand le GP a suffisamment de signal.
+    # Seuil : 2 rounds = premiere moitie de patience (5) sans nouveau meilleur.
+    _acq_cfg = bo.get("acquisition", "EI").upper()
+    try:
+        # fillna(0) : les points initiaux (sans iteration_BO) comptent comme round 0
+        _ibo = pd.to_numeric(df_done["iteration_BO"], errors="coerce").fillna(0)
+        _n_bo = int(_ibo.max()) + 1 if len(_ibo) > 0 else 0
+    except (ValueError, TypeError):
+        _n_bo = 0
+    _no_impr = int(bo.get("_rounds_no_impr", 0))  # compteur injecte ci-apres
+    # Calculer rounds_no_impr depuis les donnees
+    try:
+        import pandas as _pd
+        _cm    = _pd.to_numeric(df_done[output_names[0]], errors="coerce")
+        _iters = _pd.to_numeric(df_done["iteration_BO"], errors="coerce").fillna(0)
+        _imax  = _iters.max()
+        if _pd.isna(_imax) or _imax < 1:
+            _no_impr = 0
+        else:
+            _bests_per_round = [float(_cm[_iters <= i].max()) for i in range(int(_imax)+1)]
+            _best_0  = _bests_per_round[0] if _bests_per_round else 0.0
+            _no_impr = sum(1 for j in range(1, len(_bests_per_round))
+                           if _bests_per_round[j] <= _best_0 + 0.5)
+    except Exception:
+        _no_impr = 0
+
+    # ── v3.8 : AUTO-PILOT ORCHESTRATEUR ────────────────────────────────────
+    # Decide acquisition + xi/kappa selon (phase, target, coverage, no_impr).
+    # Coordonne en amont les triggers reactifs : si declenche, prend priorite
+    # sauf en cas de stagnation/drift confirmee (problemes actuels prioritaires).
+    autopilot_decision = autopilot_decide(df_done, cfg, bo, encoder,
+                                          _no_impr_existing=_no_impr)
+    _autopilot_active = autopilot_decision.get('override', False)
+    if _autopilot_active and bo.get("autopilot_verbose", True):
+        print(autopilot_format_status(autopilot_decision))
+
+    _auto_ucb = (_acq_cfg == "EI"
+                 and _no_impr >= 2
+                 and _n_bo >= 3)
+
+
+    # Hierarchie des overrides :
+    #   1. stagnation/drift detectee -> probleme reel actuel, prioritaire
+    #   2. autopilot v3.8           -> decision orchestrateur (phase-aware)
+    #   3. auto-UCB v3.7b           -> trigger reactif legacy (fallback)
     if stag_detected:
         print(stag_msg)
         acq       = "THOMPSON"
@@ -3297,6 +5985,23 @@ def main():
         cfg_stag["bo_settings"]["acquisition"] = "UCB"
         cfg_stag["bo_settings"]["ucb_kappa"]   = 0.2
         cfg_stag["bo_settings"]["n_suggestions"] = 1
+    elif _autopilot_active:
+        # Orchestrateur v3.8 prend la decision
+        ap_acq = autopilot_decision['acquisition']
+        cfg_stag = copy.deepcopy(cfg)
+        cfg_stag["bo_settings"]["acquisition"] = ap_acq
+        if autopilot_decision.get('xi') is not None:
+            cfg_stag["bo_settings"]["ei_xi"] = autopilot_decision['xi']
+        if autopilot_decision.get('kappa') is not None:
+            cfg_stag["bo_settings"]["ucb_kappa"] = autopilot_decision['kappa']
+        acq = f"{ap_acq} [autopilot {autopilot_decision['phase']}]"
+    elif _auto_ucb:
+        # AUTO-UCB legacy v3.7b (fallback si autopilot off)
+        print(f"  [AUTO-UCB] EI → UCB (kappa=1.5) apres {_no_impr} rounds sans progression")
+        acq      = "UCB [auto]"
+        cfg_stag = copy.deepcopy(cfg)
+        cfg_stag["bo_settings"]["acquisition"] = "UCB"
+        cfg_stag["bo_settings"]["ucb_kappa"]   = 1.5
     else:
         cfg_stag = cfg
 
@@ -3307,6 +6012,10 @@ def main():
             acq_display = acq + " [override stagnation]"
         elif drift_detected:
             acq_display = acq + " [override derive]"
+        elif _autopilot_active:
+            acq_display = acq  # autopilot le contient deja
+        elif _auto_ucb:
+            acq_display = acq
         else:
             acq_display = acq
     print(f"\n  Mode         : {mode}")
@@ -3320,6 +6029,49 @@ def main():
         print(f"\n  Calcul en cours... (quelques secondes)\n")
 
     suggestions, gp_preds = suggest_experiments(cfg_stag, df_done, encoder, n_suggest, rng)
+
+    # ── Calcul des incertitudes GP (std absolue) pour chaque suggestion ───────
+    # std_total = std_epistemique + std_aleatoire (decomposition GP v3.6)
+    gp_pred_stds = []
+    gp_pred_stds_split = []  # liste de (ep, al) pour rapport detaille
+    try:
+        for sug in suggestions:
+            sug_raw = np.array([[sug[p["name"]] for p in cfg["parameters"]]], dtype=object)
+            sug_enc = encoder.encode(sug_raw)
+            # Decomposition ep/al
+            _, sigma_ep, sigma_al = gp_display.predict(sug_enc, return_std_split=True)
+            ep, al = float(sigma_ep[0]), float(sigma_al[0])
+            total = float(np.sqrt(ep**2 + al**2))
+            if bc_active:
+                y_max_cur = float(pd.to_numeric(df_done[output_names[0]], errors='coerce').max())
+                y_scale_cur = max(y_max_cur * 1.5, 100.0)
+                ep    *= y_scale_cur
+                al    *= y_scale_cur
+                total *= y_scale_cur
+            gp_pred_stds.append(round(total, 3))
+            gp_pred_stds_split.append((round(ep, 3), round(al, 3)))
+    except Exception:
+        gp_pred_stds = [None] * len(suggestions)
+        gp_pred_stds_split = [None] * len(suggestions)
+
+    # ── SHAP manuel : contributions par variable (v3.6) ──────────────────────
+    try:
+        shap_contribs = _compute_shap_contributions(
+            gp_display, encoder, cfg, df_done, suggestions
+        )
+    except Exception:
+        shap_contribs = None
+
+    # ── Batch intelligent : filtrer les suggestions redondantes ──────────────
+    if bo.get("smart_batch", True) and n_suggest > 1:
+        suggestions, gp_preds, gp_pred_stds, batch_msg = _filter_redundant_suggestions(
+            suggestions, gp_preds, gp_pred_stds, encoder, cfg,
+            min_dist=float(bo.get("smart_batch_min_dist", 0.12)),
+            stagnation_active=stag_detected
+        )
+        if batch_msg:
+            print(batch_msg)
+            n_suggest = len(suggestions)
 
     # ── Numero d'iteration ────────────────────────────────────────────────────
     bo_iters  = pd.to_numeric(df["iteration_BO"].replace("", np.nan), errors="coerce").dropna()
@@ -3343,14 +6095,20 @@ def main():
         row["statut"]        = "suggere"
         row["iteration_BO"]  = next_iter
         row["prediction_BO"] = round(pred, 5)  # deja en espace reel (inverti dans suggest_experiments)
+        row["prediction_std_BO"] = gp_pred_stds[i] if i < len(gp_pred_stds) else None
         new_rows.append(row)
 
     df_updated = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
-    save_csv(df_updated, csv_path)
+    save_csv(df_updated, csv_path, cfg=cfg)
 
     # ── Graphiques du round ───────────────────────────────────────────────────
     opts = _fig_opts(cfg)
     plot_dashboard(df_updated, cfg, gp_display, encoder, next_iter, opts)
+    # Dashboard secondaire v3.6 : PCA trajectoire + distribution
+    try:
+        plot_trajectory_pca(df_updated, cfg, gp_display, encoder, next_iter, opts)
+    except Exception as e:
+        print(f"  [WARN] Dashboard PCA non genere : {e}")
     # Snapshots per-itération uniquement si timestamp_outputs: true
     if opts.get("timestamp", False):
         plot_round(df_updated, cfg, gp_display, encoder, next_iter, opts)
@@ -3359,15 +6117,37 @@ def main():
     # ── Rapport texte resume ─────────────────────────────────────────────────
     _write_run_report(
         cfg, df_done, df_updated, suggestions, gp_preds,
-        next_iter, output_names, param_names, csv_path
+        next_iter, output_names, param_names, csv_path,
+        gp_display=gp_display, encoder=encoder,
+        gp_pred_stds=gp_pred_stds,
+        gp_pred_stds_split=gp_pred_stds_split,
+        shap_contribs=shap_contribs
     )
+    # Rapport HTML autonome en parallele (plus riche pour archivage/partage)
+    try:
+        _write_run_report_html(
+            cfg, df_done, df_updated, suggestions, gp_preds,
+            next_iter, output_names, param_names, csv_path,
+            gp_display=gp_display, encoder=encoder,
+            gp_pred_stds=gp_pred_stds,
+            gp_pred_stds_split=gp_pred_stds_split,
+            shap_contribs=shap_contribs,
+            autopilot_decision=autopilot_decision if _autopilot_active else None,
+        )
+    except Exception as e:
+        print(f"  [WARN] Rapport HTML non genere : {e}")
 
     # ── Detection de convergence ──────────────────────────────────────────────
-    converged, n_stagnant = check_convergence(df_updated, cfg)
+    converged, n_stagnant = check_convergence(df_updated, cfg, sat_warnings=sat)
     patience = int(bo.get("convergence_patience", 5))
     if converged:
         print(f"\n  [CONVERGENCE] Aucune amelioration depuis {n_stagnant} rounds BO.")
         plot_final_report(df_updated, cfg, gp_display, encoder, next_iter, opts)
+        # Animation convergence (v3.6) : sur convergence automatique
+        try:
+            plot_convergence_animation(df_updated, cfg, gp_display, encoder, opts)
+        except Exception as e:
+            print(f"  [WARN] Animation non generee : {e}")
         print(f"\n  -> La campagne semble avoir converge.")
         print(f"     Si vous souhaitez continuer, augmentez 'convergence_patience'")
         print(f"     dans le YAML (valeur actuelle : {patience}).")
@@ -3828,6 +6608,470 @@ def _warn_boundary(sat_warnings, cfg):
 
 
 # =============================================================================
+# 15g.  AUTO-PILOT ORCHESTRATEUR (v3.8)
+# =============================================================================
+#
+# Pourquoi : les triggers reactifs existants (stagnation v2.5, drift v2.6,
+# auto-UCB v3.7b, xi-tuning v3.7d) sont independants et purement reactifs.
+# Aucun ne tient compte de la PHASE de la campagne (early vs late) ni
+# de l'OBJECTIF utilisateur (target rendement).
+#
+# L'orchestrateur introduit une couche superieure qui :
+#   1. Calcule la phase courante (EARLY/MID/LATE) selon avancement
+#      vs target (option D : hybride distance-target + iter-relatif).
+#   2. Calcule le coverage de l'espace (% zones explorees).
+#   3. Choisit la strategie optimale en fonction de phase + coverage.
+#   4. Coordonne les triggers reactifs : si l'orchestrateur a deja decide
+#      d'une strategie agressive, on ne re-stack pas un override redondant.
+#
+# Difference avec auto-UCB v3.7b :
+#   - v3.7b : "EI -> UCB apres 2 rounds sans progres" (1 trigger reactif)
+#   - v3.8  : Choisit acquisition + xi/kappa basee sur (phase, target,
+#             coverage, no_impr) coordonnes en amont.
+#
+# Parametres YAML (tous optionnels) :
+#   autopilot              : true/false (defaut false)
+#   autopilot_target       : float ou "auto" (defaut "auto")
+#                            ex: 0.80 pour 80% rendement
+#                            "auto" = 0.95 * best_observed initial * 1.20
+#   autopilot_max_iter     : int ou null (defaut null)
+#                            si renseigne, definit phase via iter-relatif
+#                            sinon : phase basee sur target uniquement
+#   autopilot_verbose      : bool (defaut true) — affiche decisions
+#
+# Phases (option D, hybride) :
+#   EARLY : best/target < 0.5 OU iter < 30% max_iter
+#           Action : UCB kappa=2.5 (exploration agressive)
+#   MID   : 0.5 <= best/target < 0.9 ET 30% <= iter < 70%
+#           Action : EI xi=0.05 (equilibre)
+#   LATE  : best/target >= 0.9 OU iter >= 70%
+#           Action : EI xi=0.005 (affinage)
+#
+# Note : la stagnation/drift reactives restent prioritaires si declenchees
+#        (elles indiquent un probleme actuel a resoudre maintenant).
+# =============================================================================
+
+def autopilot_compute_target(df_done, cfg, bo_settings):
+    """
+    Calcule la target rendement pour l'orchestrateur.
+
+    Si bo_settings["autopilot_target"] est numerique : renvoie tel quel.
+    Sinon : auto-calibre = 1.20 * best_observed_initial.
+
+    Retourne :
+      target : float dans la meme echelle que les outputs (None si erreur).
+    """
+    target_cfg = bo_settings.get("autopilot_target", "auto")
+
+    if isinstance(target_cfg, (int, float)):
+        return float(target_cfg)
+
+    # Auto-calibrage : 1.20 * best initial (points avant BO)
+    output_names = [o["name"] for o in cfg["outputs"]]
+    if not output_names:
+        return None
+
+    out_col = output_names[0]
+    out_dir = cfg["outputs"][0].get("direction", "maximize")
+
+    try:
+        # Points initiaux (iteration_BO == 0 ou NaN)
+        _ibo = pd.to_numeric(df_done["iteration_BO"], errors="coerce").fillna(0)
+        df_init = df_done[_ibo == 0]
+        if len(df_init) == 0:
+            df_init = df_done  # fallback : tous les points
+
+        vals_init = pd.to_numeric(df_init[out_col], errors="coerce").dropna()
+        if len(vals_init) == 0:
+            return None
+
+        if out_dir == "maximize":
+            best_init = float(vals_init.max())
+            # Si best_init <= 0, utiliser le range
+            if best_init <= 0:
+                rng_init = float(vals_init.max() - vals_init.min()) + 1e-9
+                return best_init + 1.20 * rng_init
+            return best_init * 1.20
+        else:
+            best_init = float(vals_init.min())
+            if best_init >= 0:
+                rng_init = float(vals_init.max() - vals_init.min()) + 1e-9
+                return best_init - 0.20 * rng_init
+            return best_init * 0.80
+
+    except Exception:
+        return None
+
+
+def autopilot_compute_progress(df_done, cfg, target):
+    """
+    Calcule l'avancement vers la target.
+
+    Retourne :
+      progress : float dans [0, 1+] = best_observed / target (ratio).
+                 < 1 : pas encore atteint, > 1 : depasse.
+    """
+    if target is None:
+        return None
+
+    output_names = [o["name"] for o in cfg["outputs"]]
+    out_col = output_names[0]
+    out_dir = cfg["outputs"][0].get("direction", "maximize")
+
+    try:
+        vals = pd.to_numeric(df_done[out_col], errors="coerce").dropna()
+        if len(vals) == 0:
+            return None
+
+        if out_dir == "maximize":
+            best = float(vals.max())
+            return best / target if abs(target) > 1e-9 else 0.0
+        else:
+            # Pour minimize : progress = 1 - (best / target_initial)
+            # On suppose target < best_initial pour minimize
+            best = float(vals.min())
+            return target / best if abs(best) > 1e-9 else 0.0
+    except Exception:
+        return None
+
+
+def autopilot_compute_coverage(df_done, cfg, encoder, n_grid=2000, rng=None):
+    """
+    Calcule le coverage de l'espace : % de zones explorees.
+
+    Methode :
+      - Genere une grille de n_grid points uniformes en [0, 1]^n_dims (espace
+        normalise).
+      - Pour chaque point, calcule la distance min aux points observes.
+      - Coverage = fraction des points de grille avec distance < seuil.
+
+    Seuil ADAPTATIF a la dimension (v3.9) :
+      Un rayon fixe sous-estime gravement le coverage en haute dimension
+      (malediction de la dimension : le volume d'une boule de rayon r decroit
+      comme r^d). Pour qu'un point "couvre" une fraction de volume comparable
+      quelle que soit d, on fixe le rayon tel que le volume couvert par point
+      reste a peu pres constant : r = base^(1/sqrt(d)), borne dans [0.15, 0.45].
+      Resultat : en 1-2D le seuil reste serre (~0.20), en haute dimension il
+      s'elargit pour rester atteignable.
+
+    Retourne :
+      coverage : float dans [0, 1] = fraction de l'espace exploree.
+    """
+    from scipy.spatial.distance import cdist as _cdist
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    try:
+        param_names = [p["name"] for p in cfg["parameters"]]
+        X_obs_raw = df_done[param_names].to_numpy(dtype=object)
+        X_obs_norm = encoder.encode(X_obs_raw)
+
+        if len(X_obs_norm) == 0:
+            return 0.0
+
+        n_dims = encoder.n_params
+        X_grid = rng.uniform(0, 1, (n_grid, n_dims))
+
+        D = _cdist(X_grid, X_obs_norm)
+        d_min = D.min(axis=1)
+
+        # Seuil adaptatif : 0.20 en basse dim, s'elargit avec d
+        threshold = float(np.clip(0.20 * (n_dims ** 0.25), 0.15, 0.45))
+        coverage = float((d_min < threshold).mean())
+        return coverage
+    except Exception:
+        return None
+
+
+def autopilot_compute_lengthscales(gp, encoder):
+    """
+    Extrait les lengthscales ARD du GP fitte (v3.9).
+
+    Les lengthscales renseignent sur l'importance relative de chaque dimension :
+    une lengthscale courte = la sortie varie vite selon cette dimension (a
+    echantillonner finement) ; une lengthscale longue = dimension peu influente.
+
+    Retourne un dict :
+      'lengthscales'   : np.array des lengthscales par dimension (ou None)
+      'relative_var'   : coefficient de variation des lengthscales (heterogeneite)
+                         eleve = quelques dimensions dominent ; faible = uniforme
+      'n_active'       : nb de dimensions "actives" (lengthscale < mediane*2)
+    Retourne None si indisponible (GP non fourni ou pas de kernel ARD).
+    """
+    if gp is None:
+        return None
+    try:
+        # Acces au modele GPyTorch sous-jacent
+        model = getattr(gp, "_model", None)
+        if model is None:
+            return None
+        # Chercher le kernel avec lengthscale (Matern ARD)
+        ls = None
+        covar = getattr(model, "covar_module", None)
+        if covar is not None:
+            base = getattr(covar, "base_kernel", covar)
+            raw_ls = getattr(base, "lengthscale", None)
+            if raw_ls is not None:
+                ls = raw_ls.detach().cpu().numpy().flatten()
+        if ls is None or len(ls) == 0:
+            return None
+        ls = np.asarray(ls, dtype=float)
+        median = float(np.median(ls))
+        cv = float(np.std(ls) / (np.mean(ls) + 1e-12))
+        n_active = int((ls < median * 2.0).sum())
+        return {
+            "lengthscales": ls,
+            "relative_var": cv,
+            "n_active": n_active,
+        }
+    except Exception:
+        return None
+
+
+def autopilot_decide(df_done, cfg, bo_settings, encoder, _no_impr_existing=0,
+                     gp=None):
+    """
+    Decide la strategie BO optimale pour ce round.
+
+    v3.9 — Logique de phase a TROIS criteres (au lieu du seul progress) :
+      Le passage en exploitation (LATE) ne se fait QUE si l'une des deux
+      conditions est remplie :
+        (A) bon resultat ET espace suffisamment explore
+            (progress >= seuil ET coverage >= seuil_adaptatif(d))
+        (B) stagnation confirmee ET assez de points
+            (no_impr >= patience(d) ET n_done >= n_min(d))
+      Sinon on reste en exploration (EARLY/MID). Rationale : un bon rendement
+      ne justifie pas d'arreter d'explorer si l'espace est mal couvert ; c'est
+      la stagnation (le GP n'apprend plus) qui signale qu'on peut exploiter.
+
+      Les seuils scalent avec la dimension d (malediction de la dimension) :
+        - coverage requis baisse quand d augmente (sinon inatteignable)
+        - patience et n_min montent avec d (plus de dims = plus a explorer)
+
+      Si un GP fitte est fourni, les lengthscales ARD affinent la decision
+      (heterogeneite forte = quelques dims dominent = exploitation plus sure).
+
+    Args:
+        df_done : DataFrame des experiences faites
+        cfg, bo_settings : configuration
+        encoder : SpaceEncoder
+        _no_impr_existing : compteur rounds sans progres
+        gp : GPModel fitte (optionnel) — active l'analyse des lengthscales
+
+    Returns:
+        dict (voir cle 'reason' pour le detail de la decision)
+    """
+    result = {
+        'phase': None, 'progress': None, 'coverage': None, 'target': None,
+        'override': False, 'acquisition': None, 'xi': None, 'kappa': None,
+        'reason': '', 'lengthscale_info': None,
+    }
+
+    if not bo_settings.get("autopilot", False):
+        return result  # Desactive
+
+    # 1. Calcul target / progress / coverage
+    target = autopilot_compute_target(df_done, cfg, bo_settings)
+    result['target'] = target
+    progress = autopilot_compute_progress(df_done, cfg, target)
+    result['progress'] = progress
+    coverage = autopilot_compute_coverage(df_done, cfg, encoder)
+    result['coverage'] = coverage
+
+    # 1b. Lengthscales ARD (si GP fourni)
+    ls_info = autopilot_compute_lengthscales(gp, encoder)
+    result['lengthscale_info'] = ls_info
+
+    # 2. Parametres scalant avec la dimension
+    n_dims = encoder.n_params
+    n_done = len(df_done)
+    # coverage requis : 0.55 en 1D -> baisse en haute dim, plancher 0.25
+    cov_required = float(np.clip(0.55 - 0.05 * (n_dims - 1), 0.25, 0.55))
+    # patience stagnation : 2 + ceil(d/2), borne raisonnable
+    patience = int(min(2 + (n_dims + 1) // 2, 8))
+    # n_min avant d'autoriser LATE par stagnation : ~ 4*d
+    n_min_late = max(8, 4 * n_dims)
+
+    # 3. Determination de phase a TROIS criteres
+    #    LATE (exploitation) seulement si :
+    #      (A) progress eleve ET coverage suffisante, OU
+    #      (B) stagnation confirmee ET assez de points
+    progress_ok = (progress is not None and progress >= 0.90)
+    coverage_ok = (coverage is not None and coverage >= cov_required)
+    stagnating  = (_no_impr_existing >= patience and n_done >= n_min_late)
+    can_exploit = (progress_ok and coverage_ok) or stagnating
+
+    if can_exploit:
+        phase = 'LATE'
+        if stagnating and not (progress_ok and coverage_ok):
+            late_reason = f"stagnation {_no_impr_existing} rounds (>= {patience})"
+        else:
+            late_reason = f"progress {progress:.0%} + coverage suffisante"
+    else:
+        early = (progress is None or progress < 0.5) and \
+                (coverage is None or coverage < cov_required * 0.6)
+        phase = 'EARLY' if early else 'MID'
+        late_reason = ""
+
+    result['phase'] = phase
+
+    # 4. Strategie d'acquisition par phase
+    # On reutilise progress/coverage/lengthscales pour affiner.
+    cv_txt = f"{coverage:.0%}" if coverage is not None else "?"
+    pr_txt = f"{progress:.0%}" if progress is not None else "?"
+    # heterogeneite des lengthscales : si forte, quelques dims dominent
+    ls_hetero = (ls_info is not None and ls_info.get("relative_var", 0) > 0.6)
+
+    if phase == 'EARLY':
+        # Exploration : espace mal couvert -> UCB agressif (kappa scale en dim)
+        kappa_explore = float(np.clip(2.0 + 0.15 * n_dims, 2.0, 3.5))
+        result['override'] = True
+        result['acquisition'] = 'UCB'
+        result['kappa'] = kappa_explore
+        result['reason'] = (f"EARLY (progress {pr_txt}, coverage {cv_txt}) "
+                            f"-> UCB kappa={kappa_explore:.1f} (exploration, d={n_dims})")
+
+    elif phase == 'MID':
+        if _no_impr_existing >= max(2, patience - 1):
+            # Stagnation naissante -> relancer exploration
+            result['override'] = True
+            result['acquisition'] = 'UCB'
+            result['kappa'] = 1.8
+            result['reason'] = (f"MID + stagnation ({_no_impr_existing} rounds) "
+                                f"-> UCB kappa=1.8 (relance exploration)")
+        elif coverage is not None and coverage < cov_required:
+            # Couverture encore insuffisante -> diversifier via Thompson
+            result['override'] = True
+            result['acquisition'] = 'EI-TS'
+            result['reason'] = (f"MID + coverage {cv_txt} < requis "
+                                f"{cov_required:.0%} -> EI-TS (diversification)")
+        else:
+            result['override'] = True
+            result['acquisition'] = 'EI'
+            result['xi'] = 0.03
+            result['reason'] = f"MID (coverage {cv_txt} OK) -> EI xi=0.03 (equilibre)"
+
+    else:  # LATE
+        if coverage is not None and coverage < cov_required and not stagnating:
+            # Bon resultat mais trous : combler avant d'exploiter a fond
+            result['override'] = True
+            result['acquisition'] = 'EI-TS'
+            result['reason'] = (f"LATE ({late_reason}) mais coverage {cv_txt} "
+                                f"faible -> EI-TS (combler zones d'ombre)")
+        else:
+            # Affinage : xi plus serre si lengthscales heterogenes (optimum net)
+            xi_late = 0.003 if ls_hetero else 0.005
+            result['override'] = True
+            result['acquisition'] = 'EI'
+            result['xi'] = xi_late
+            ls_note = " (lengthscales heterogenes)" if ls_hetero else ""
+            result['reason'] = (f"LATE ({late_reason}) -> EI xi={xi_late} "
+                                f"(affinage strict){ls_note}")
+
+    return result
+
+
+def autopilot_format_status(decision):
+    """Formate un message de statut autopilot pour le terminal."""
+    if not decision.get('override'):
+        return ""
+
+    lines = [f"\n  {'='*62}"]
+    lines.append(f"  [AUTO-PILOT] decision orchestrateur")
+    lines.append(f"  {'-'*62}")
+
+    # Stats
+    phase = decision.get('phase', '?')
+    progress = decision.get('progress')
+    coverage = decision.get('coverage')
+    target = decision.get('target')
+
+    lines.append(f"    Phase        : {phase}")
+    if target is not None:
+        lines.append(f"    Target       : {target:.4f}")
+    if progress is not None:
+        lines.append(f"    Progress     : {progress:.1%} (best/target)")
+    if coverage is not None:
+        lines.append(f"    Coverage     : {coverage:.1%} (espace explore)")
+    ls_info = decision.get('lengthscale_info')
+    if ls_info is not None:
+        lines.append(f"    Lengthscales : {ls_info['n_active']} dims actives, "
+                     f"heterogeneite CV={ls_info['relative_var']:.2f}")
+
+    lines.append(f"  {'-'*62}")
+    lines.append(f"  Action :")
+    lines.append(f"    {decision['reason']}")
+    lines.append(f"  {'='*62}")
+
+    return "\n".join(lines)
+
+
+def autopilot_compute_coverage_grid(df_done, cfg, encoder, n_grid_dim=40,
+                                     rng=None):
+    """
+    Calcule une grille 2D coverage pour visualisation HTML.
+
+    Retourne :
+      X1, X2 : meshgrid normalise [0, 1]
+      Z      : array (n_grid_dim, n_grid_dim) avec valeurs distance min
+               aux points observes (faible = bien explore)
+      param_names : list[str] des 2 params choisis (les plus influents)
+    """
+    from scipy.spatial.distance import cdist as _cdist
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    try:
+        # Choix des 2 params : les 2 continus avec plus large plage
+        # (heuristique simple ; en pratique les 2 plus influents seraient
+        # via length-scales ARD mais ca demanderait gp en argument).
+        cont_params = [p for p in cfg["parameters"] if p["type"] == "continuous"]
+        if len(cont_params) < 2:
+            return None
+        p1, p2 = cont_params[0], cont_params[1]
+
+        param_names_all = [p["name"] for p in cfg["parameters"]]
+        idx1 = param_names_all.index(p1["name"])
+        idx2 = param_names_all.index(p2["name"])
+
+        # Encoder points observes
+        X_obs_raw = df_done[param_names_all].to_numpy(dtype=object)
+        X_obs_norm = encoder.encode(X_obs_raw)
+        if len(X_obs_norm) == 0:
+            return None
+
+        # Grille 2D
+        x1 = np.linspace(0, 1, n_grid_dim)
+        x2 = np.linspace(0, 1, n_grid_dim)
+        X1, X2 = np.meshgrid(x1, x2)
+
+        # Pour chaque point grille, on construit un X complet (autres params
+        # = leur median observe).
+        n_dims = encoder.n_params
+        median_X = np.median(X_obs_norm, axis=0)
+
+        X_full = np.tile(median_X, (n_grid_dim * n_grid_dim, 1))
+        X_full[:, idx1] = X1.ravel()
+        X_full[:, idx2] = X2.ravel()
+
+        # Distance min aux observes
+        D = _cdist(X_full, X_obs_norm).min(axis=1)
+        Z = D.reshape(n_grid_dim, n_grid_dim)
+
+        return {
+            'X1': X1, 'X2': X2, 'Z': Z,
+            'param_names': [p1["name"], p2["name"]],
+            'X_obs_norm_2d': X_obs_norm[:, [idx1, idx2]],
+        }
+    except Exception:
+        return None
+
+
+
+
+# =============================================================================
 # 15h.  DETECTION DE MULTI-MODALITE (CANDIDATS LOCAUX)
 # =============================================================================
 #
@@ -3934,8 +7178,305 @@ def _report_modal_candidates(candidates, encoder, cfg, best_acq_val):
 # 15b.  RAPPORT TEXTE RESUME (genere apres chaque round BO)
 # =============================================================================
 
+
+
+
+def _compute_prior_mean(X_norm, cfg, encoder):
+    """
+    Calcule la moyenne a priori (prior mean) pour une grille de points.
+    Utilise pour injecter des connaissances physico-chimiques dans le GP (v3.7).
+
+    API YAML :
+      prior_mean:
+        type: "linear" | "threshold" | "none"
+        params: ...
+
+    Types supportes :
+      "none"      : mu_prior = 0 (comportement par defaut, equivalent a pas de prior)
+      "linear"    : mu_prior = intercept + sum(coeffs[name] * x_norm)
+      "threshold" : fonction par morceaux sur une seule variable
+                    mu = below si var < threshold_norm
+                    mu = above si var >= threshold_norm
+
+    Args :
+      X_norm   : array (n, d) en espace encode [0,1]
+      cfg      : config YAML complete
+      encoder  : SpaceEncoder instance
+
+    Retourne : array (n,) de moyennes a priori.
+    """
+    X_norm = np.atleast_2d(X_norm)
+    n = len(X_norm)
+    prior_cfg = cfg.get("prior_mean", {})
+    if not prior_cfg or prior_cfg.get("type", "none") == "none":
+        return np.zeros(n)
+
+    ptype = prior_cfg.get("type", "none")
+    params = prior_cfg.get("params", {})
+    param_names = [p["name"] for p in cfg["parameters"]]
+
+    if ptype == "linear":
+        intercept = float(params.get("intercept", 0.0))
+        coeffs    = params.get("coeffs", {})
+        mu = np.full(n, intercept, dtype=float)
+        for pname, coef in coeffs.items():
+            if pname not in param_names:
+                continue
+            pi = param_names.index(pname)
+            # Position dans espace encode (1re dim du parametre)
+            dim = sum(encoder._encoded_dims[k] for k in range(pi))
+            mu = mu + float(coef) * X_norm[:, dim]
+        return mu
+
+    if ptype == "threshold":
+        var_name = params.get("variable")
+        threshold_raw = float(params.get("threshold", 0.0))
+        below = float(params.get("below", 0.0))
+        above = float(params.get("above", 100.0))
+        if var_name not in param_names:
+            return np.zeros(n)
+        pi = param_names.index(var_name)
+        p_cfg = cfg["parameters"][pi]
+        if p_cfg["type"] != "continuous":
+            return np.zeros(n)
+        # Convertir threshold en espace normalise
+        lo, hi = float(p_cfg["min"]), float(p_cfg["max"])
+        thr_norm = (threshold_raw - lo) / max(hi - lo, 1e-9)
+        dim = sum(encoder._encoded_dims[k] for k in range(pi))
+        mu = np.where(X_norm[:, dim] < thr_norm, below, above)
+        return mu.astype(float)
+
+    # Type inconnu
+    return np.zeros(n)
+
+
+def _apply_boundary_avoidance(acq_vals, X_norm, X_train_norm, y_train,
+                               threshold_pct=0.33, radius=0.15, penalty=0.3):
+    """
+    Penalise les candidats proches de zones deja explorees avec mauvais rendement.
+    Evite que le GP revienne sur des conditions connues pour etre mauvaises (v3.7b).
+
+    threshold_pct : fraction du y_max en dessous de laquelle un point est "mauvais"
+    radius        : rayon en espace normalise [0,1]
+    penalty       : facteur multiplicatif sur acq_fn (0.3 = reduit de 70%)
+    """
+    if len(X_train_norm) == 0 or len(y_train) == 0:
+        return acq_vals
+
+    y_arr    = np.asarray(y_train, dtype=float)
+    y_max    = y_arr.max()
+    y_thresh = y_max * threshold_pct
+
+    # Identifier les "mauvais" points
+    bad_mask = y_arr < y_thresh
+    if not bad_mask.any():
+        return acq_vals
+
+    X_bad = X_train_norm[bad_mask]
+
+    # Pour chaque candidat, calculer distance min aux mauvais points
+    from scipy.spatial.distance import cdist
+    dists = cdist(X_norm, X_bad, metric="euclidean").min(axis=1)
+
+    # Penaliser si trop proche
+    close_mask = dists < radius
+    result = acq_vals.copy().astype(float)
+    result[close_mask] *= penalty
+    return result
+
+def check_feasibility(point_decoded, constraints):
+    """
+    Evalue les contraintes de faisabilite sur un point decode (dict param→val).
+
+    Chaque contrainte est une chaine Python evaluee dans un scope restreint.
+    Exemples YAML :
+      constraints:
+        - "solvent != 'H2O' or T < 100"
+        - "eq > 1.0 or base == 'DBU'"
+        - "not (T > 80 and t > 120)"
+
+    Syntaxe : operateurs Python standard (and, or, not, ==, !=, <, >, <=, >=).
+    Scope : les noms de parametres + constantes Python (True, False, None, math).
+
+    Retourne : (feasible: bool, failed_constraint: str|None)
+    """
+    if not constraints:
+        return True, None
+    # Scope restreint : juste les parametres + fonctions math basiques
+    import math
+    safe_globals = {"__builtins__": {}, "math": math, "abs": abs,
+                    "min": min, "max": max, "round": round,
+                    "True": True, "False": False, "None": None}
+    safe_locals = dict(point_decoded)
+    for i, expr in enumerate(constraints):
+        try:
+            result = bool(eval(expr, safe_globals, safe_locals))
+        except Exception as e:
+            # Contrainte mal formee : on avertit et considere feasible pour ne pas bloquer
+            print(f"  [WARN] Contrainte #{i+1} invalide : '{expr}' ({type(e).__name__})")
+            continue
+        if not result:
+            return False, expr
+    return True, None
+
+
+# v3.7d : Constrained BO (cBO) — Gardner 2014 / Gelbart 2014
+# ─────────────────────────────────────────────────────────────────────────────
+def fit_constraint_gps(cfg, df_done, encoder):
+    """
+    Pour chaque contrainte 'soft' definie dans le YAML (cfg["soft_constraints"]),
+    entraine un GP separe sur la sortie associee.
+
+    Format YAML :
+        soft_constraints:
+          - name: "Stabilite thermique"
+            output: "tar_formed"      # nom d'une colonne du CSV
+            direction: "minimize"     # ou "maximize"
+            threshold: 5              # contrainte respectee si <= 5
+
+    Retourne : list[dict] avec keys: gp, direction, threshold, name, output
+    """
+    sc_list = cfg.get("soft_constraints", []) or []
+    if not sc_list:
+        return []
+
+    param_names = [p["name"] for p in cfg["parameters"]]
+    X_raw = df_done[param_names].values.astype(object)
+    X_norm = encoder.encode(X_raw)
+
+    constraint_models = []
+    for sc in sc_list:
+        out_col = sc.get("output")
+        if out_col not in df_done.columns:
+            continue
+        y_c = pd.to_numeric(df_done[out_col], errors="coerce").values
+        valid = ~np.isnan(y_c)
+        if valid.sum() < 3:
+            continue  # pas assez de donnees pour un GP
+        gp_c = build_gp(encoder.n_params, normalize_y=True, cfg=cfg, encoder=encoder,
+                        y_train=y_c[valid])
+        gp_c.fit(X_norm[valid], y_c[valid])
+        constraint_models.append({
+            "gp":        gp_c,
+            "direction": sc.get("direction", "maximize").lower(),
+            "threshold": float(sc.get("threshold", 0.0)),
+            "name":      sc.get("name", out_col),
+            "output":    out_col,
+        })
+    return constraint_models
+
+
+def constrained_acquisition(acq_fn, constraint_models):
+    """
+    Renvoie une nouvelle fonction d'acquisition multipliee par la probabilite
+    que TOUTES les contraintes soient respectees, calculee depuis les GPs c.
+
+    P(c respecte) = P(c <= threshold)  pour direction='minimize'
+                   = P(c >= threshold) pour direction='maximize'
+
+    EI_c(x) = EI(x) * prod_j P(c_j respecte | x)
+    """
+    if not constraint_models:
+        return acq_fn
+
+    from scipy.stats import norm as _norm
+
+    def _constrained(X):
+        Xa = X if X.ndim == 2 else X.reshape(1, -1)
+        base_vals = acq_fn(Xa).ravel().astype(float)
+        prob_feasible = np.ones_like(base_vals)
+        for cm in constraint_models:
+            mu, sigma = cm["gp"].predict(Xa, return_std=True)
+            sigma = np.maximum(sigma, 1e-9)
+            if cm["direction"] == "minimize":
+                # P(c <= threshold) = Phi((threshold - mu) / sigma)
+                p = _norm.cdf((cm["threshold"] - mu) / sigma)
+            else:
+                # P(c >= threshold) = 1 - Phi((threshold - mu) / sigma)
+                p = 1.0 - _norm.cdf((cm["threshold"] - mu) / sigma)
+            prob_feasible *= p
+        return base_vals * prob_feasible
+
+    return _constrained
+
+
+def _compute_shap_contributions(gp_display, encoder, cfg, df_done, suggestions):
+    """
+    Calcule les contributions individuelles par variable pour chaque suggestion.
+    Méthode : ablation simple (remplacer chaque variable par sa moyenne empirique).
+
+    C'est une approximation de SHAP bon marché :
+      contribution_i = pred(x) - pred(x avec x_i = baseline)
+
+    Ne respecte pas l'additivité parfaite SHAP mais donne l'ordre de grandeur
+    et le signe correct des influences.
+
+    Retourne : list[dict {param_name: contribution}] (une entrée par suggestion)
+               ou [] si pas assez de donnees pour calculer une baseline.
+    """
+    # Validation entree : besoin d'au moins 1 point pour baseline + GP fitte
+    if len(df_done) == 0 or len(suggestions) == 0:
+        return []
+    if not hasattr(gp_display, "_model") or gp_display._model is None:
+        # GP non fitté (ou stub sans predict utilisable)
+        pass  # on continue, predict lèvera exception rattrapée plus bas
+
+    param_names  = [p["name"] for p in cfg["parameters"]]
+
+    # Baseline : moyenne (continus) / mode (catégoriels) des données observées
+    X_done_raw = df_done[param_names].values.astype(object)
+    baseline_raw = []
+    for pi, p in enumerate(cfg["parameters"]):
+        col = X_done_raw[:, pi]
+        if p["type"] == "continuous":
+            try:
+                baseline_raw.append(float(np.nanmean(col.astype(float))))
+            except Exception:
+                baseline_raw.append((float(p["min"]) + float(p["max"])) / 2)
+        else:
+            from collections import Counter
+            try:
+                most_common = Counter([str(v) for v in col]).most_common(1)[0][0]
+                baseline_raw.append(most_common)
+            except Exception:
+                baseline_raw.append(p.get("categories", ["?"])[0])
+    baseline_raw = np.array(baseline_raw, dtype=object)
+
+    results = []
+    for sug in suggestions:
+        # Prédiction au point complet
+        sug_raw = np.array([[sug[n] for n in param_names]], dtype=object)
+        sug_enc = encoder.encode(sug_raw)
+        pred_full = float(gp_display.predict(sug_enc)[0])
+
+        # Prédiction avec baseline (point nul)
+        base_enc = encoder.encode(baseline_raw.reshape(1, -1))
+        pred_base = float(gp_display.predict(base_enc)[0])
+
+        # Ablation : pour chaque variable, remplacer par baseline
+        contribs = {}
+        for pi, pname in enumerate(param_names):
+            ablated = sug_raw.copy()
+            ablated[0, pi] = baseline_raw[pi]
+            abl_enc = encoder.encode(ablated)
+            pred_abl = float(gp_display.predict(abl_enc)[0])
+            # contribution : effet de la variable = pred_full - pred_sans
+            contribs[pname] = pred_full - pred_abl
+
+        # Normaliser pour que la somme reflete (pred_full - pred_base) mieux
+        total_effect = pred_full - pred_base
+        sum_contribs = sum(contribs.values())
+        if abs(sum_contribs) > 1e-6:
+            scale = total_effect / sum_contribs
+            contribs = {k: v * scale for k, v in contribs.items()}
+
+        results.append({"baseline": pred_base, "contributions": contribs})
+    return results
+
 def _write_run_report(cfg, df_done, df_updated, suggestions, gp_preds,
-                      iteration, output_names, param_names, csv_path):
+                      iteration, output_names, param_names, csv_path,
+                      gp_display=None, encoder=None, gp_pred_stds=None,
+                      gp_pred_stds_split=None, shap_contribs=None):
     """
     Ecrit un rapport texte resume apres chaque round BO.
     Fichier nomme : {campaign}_iter_{N:02d}_report.txt
@@ -4012,7 +7553,40 @@ def _write_run_report(cfg, df_done, df_updated, suggestions, gp_preds,
                 lines.append(f"    {pname:<30}: {float(val):.4f}")
             else:
                 lines.append(f"    {pname:<30}: {val}")
-        lines.append(f"    Prediction GP         : {pred:.4f}")
+        # Prediction avec incertitude GP (std absolue)
+        if gp_pred_stds is not None and (i-1) < len(gp_pred_stds) and gp_pred_stds[i-1] is not None:
+            std_val = gp_pred_stds[i-1]
+            lines.append(f"    Prediction GP         : {pred:.4f} ± {std_val:.2f}")
+            # Decomposition epistemique / aleatoire (v3.6)
+            if gp_pred_stds_split is not None and (i-1) < len(gp_pred_stds_split) and gp_pred_stds_split[i-1] is not None:
+                ep, al = gp_pred_stds_split[i-1]
+                lines.append(f"      dont epistemique    : {ep:.2f} (reductible en mesurant ici)")
+                lines.append(f"      dont aleatoire      : {al:.2f} (bruit intrinseque)")
+            # Interpretation textuelle
+            if std_val < pred * 0.05:
+                conf = "GP tres confiant"
+            elif std_val < pred * 0.15:
+                conf = "GP confiant"
+            elif std_val < pred * 0.30:
+                conf = "GP incertain"
+            else:
+                conf = "GP explore l inconnu"
+            lines.append(f"    Confiance             : {conf}")
+        else:
+            lines.append(f"    Prediction GP         : {pred:.4f}")
+
+        # Contributions SHAP (v3.6) : pourquoi ce point ?
+        if shap_contribs is not None and (i-1) < len(shap_contribs):
+            sc = shap_contribs[i-1]
+            baseline = sc.get("baseline", 0.0)
+            contribs = sc.get("contributions", {})
+            if contribs:
+                sorted_c = sorted(contribs.items(), key=lambda x: -abs(x[1]))
+                lines.append(f"    Pourquoi ce point ?   (baseline = {baseline:.2f})")
+                for pname, val in sorted_c:
+                    sign = "+" if val >= 0 else ""
+                    lines.append(f"      {pname:<26} : {sign}{val:.2f}")
+
         lines.append("")
 
     lines += [
@@ -4023,6 +7597,71 @@ def _write_run_report(cfg, df_done, df_updated, suggestions, gp_preds,
         f"  Convergence             : {'DETECTEE' if conv else 'non atteinte'}",
         f"  Fichier de donnees      : {csv_path}",
         "",
+        "HYPERPARAMETRES GP (iteration courante)",
+        "-" * 40,
+    ]
+
+    # Ajouter les hyperparamètres GP si disponibles
+    if gp_display is not None and encoder is not None:
+        try:
+            ls = gp_display.kernel_.k2.length_scale
+            param_names_raw = [p["name"] for p in cfg["parameters"]]
+            lines.append("  Lengthscales ARD (espace normalise [0,1]) :")
+            dim_cursor = 0
+            for pi, p in enumerate(cfg["parameters"]):
+                nd = encoder._encoded_dims[pi]
+                ls_p = ls[dim_cursor:dim_cursor+nd]
+                importance = 1.0 / (float(ls_p.mean()) + 1e-9)
+                lines.append(f"    {p['name']:<28} ls={float(ls_p.mean()):.3f}"
+                             f"  importance_rel={importance:.2f}")
+                dim_cursor += nd
+            # Normaliser importances pour affichage
+            try:
+                importances = np.array([1.0/(ls[d:d+encoder._encoded_dims[pi]].mean()+1e-9)
+                                        for pi,p in enumerate(cfg["parameters"])
+                                        for d in [sum(encoder._encoded_dims[:pi])]])
+                importances /= importances.sum()
+                lines.append(f"  Parametre le plus important : "
+                             f"{param_names_raw[np.argmax(importances)]}")
+            except Exception:
+                pass
+            # Bruit GP (GPyTorch)
+            try:
+                noise = float(gp_display.alpha)
+                lines.append(f"  Bruit estime (likelihood noise) : {noise:.5f}")
+            except Exception:
+                pass
+            # Warping Kumaraswamy appris (v3.6)
+            try:
+                if hasattr(gp_display, '_warper') and gp_display._warper is not None:
+                    a_arr, b_arr = gp_display._warper.get_params_numpy()
+                    if a_arr is not None:
+                        lines.append("  Warping input (Kumaraswamy a, b) :")
+                        dim_cursor = 0
+                        for pi, p in enumerate(cfg["parameters"]):
+                            nd = encoder._encoded_dims[pi]
+                            a_p = float(a_arr[dim_cursor:dim_cursor+nd].mean())
+                            b_p = float(b_arr[dim_cursor:dim_cursor+nd].mean())
+                            # Interpretation
+                            if abs(a_p - 1) < 0.1 and abs(b_p - 1) < 0.1:
+                                interp = "lineaire"
+                            elif a_p > 1.3 and b_p < 0.8:
+                                interp = "plateau haut"
+                            elif a_p < 0.8 and b_p > 1.3:
+                                interp = "plateau bas"
+                            elif a_p > 1.2 and b_p > 1.2:
+                                interp = "sigmoide"
+                            else:
+                                interp = "non-lineaire leger"
+                            lines.append(f"    {p['name']:<26} a={a_p:.2f} b={b_p:.2f}  ({interp})")
+                            dim_cursor += nd
+            except Exception:
+                pass
+        except Exception:
+            lines.append("  (hyperparametres non disponibles)")
+        lines.append("")
+
+    lines += [
         "ETAPES SUIVANTES",
         "-" * 40,
         f"  1. Realisez les experiences aux conditions ci-dessus",

@@ -1,0 +1,28 @@
+campaign_name: suzuki_test
+parameters:
+  - name: Temperature
+    type: continuous
+    min: 40
+    max: 110
+  - name: Loading catalyseur
+    type: continuous
+    min: 1
+    max: 8
+  - name: Solvant
+    type: categorical
+    categories: ["DMF", "MeCN", "1,4-Dioxane", "THF", "Toluène"]
+    descriptors_file: "examples/descripteurs_chimiques.xlsx"
+    descriptors_sheet: "Solvants"
+    descriptors_columns: ["ε (25°C)", "μ (D)", "δP (MPa½)", "δH (MPa½)", "log P"]
+outputs:
+  - name: Rendement (%)
+    direction: maximize
+    weight: 1.0
+    max: 100
+noise_prior: low
+bo_settings:
+  n_suggestions: 1
+  acquisition: EI
+  autopilot: true
+  autopilot_target: 90
+  autopilot_max_iter: 25

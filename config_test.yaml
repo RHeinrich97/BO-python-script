@@ -1,28 +1,28 @@
 # ==============================================================================
 # FICHIER DE CONFIGURATION – Optimisation Bayésienne en Chimie
-# bo_chemistry.py  |  v3.3
+# bo_chemistry.py  |  v3.8
 # ==============================================================================
 #
 # COMMENT UTILISER CE FICHIER
 # ----------------------------
-# 1. Copiez ce fichier et renommez-le pour votre campagne :
-#       cp config_template.yaml acylation_ball_mill.yaml
+# 1. Copier ce fichier et le renommer pour votre campagne :
+#       cp config_test.yaml ma_campagne.yaml
 #
-# 2. Remplissez les sections ci-dessous (cherchez les balises  <- MODIFIER)
+# 2. Remplir les sections ci-dessous (chercher les balises  <- MODIFIER)
 #
 # 3. Premier lancement :
-#       python bo_chemistry.py acylation_ball_mill.yaml
-#    -> Le CSV est cree automatiquement. Remplissez vos donnees initiales.
+#       python bo_chemistry.py ma_campagne.yaml
+#    -> Le CSV est cree automatiquement. Remplir les donnees initiales.
 #
-# 4. Relancez le script apres chaque serie d'experiences.
+# 4. Relancer le script apres chaque serie d'experiences.
 #
-# SYNTAXE YAML RAPPEL
-# --------------------
-# - Les lignes commencant par # sont des commentaires (ignores)
-# - Les listes commencent par un tiret -
-# - Les valeurs numeriques N'ont PAS de guillemets : 60
-# - Les chaines de caracteres PEUVENT avoir des guillemets : "DMF"
-# - L'indentation (espaces) est significative -- n'utilisez pas de tabulations
+# SYNTAXE YAML
+# -------------
+# - Lignes commencant par # = commentaires (ignorees)
+# - Listes commencent par un tiret -
+# - Valeurs numeriques sans guillemets : 60
+# - Chaines de caracteres entre guillemets : "DMF"
+# - Indentation = espaces (pas de tabulations)
 # ==============================================================================
 
 
@@ -54,27 +54,53 @@ parameters:
     min: 1.0
     max: 3.0
 
+  # ── Encoding log_ratio pour variables de type ratio ──────────────────────
+  # Utile pour stoichiometries (acide/amine, ligand/metal).
+  # Le GP travaille en ln(x) : ratio 2:1 aussi eloigne de 1:1 que 1:2.
+  # - name: "Equivalents acide/amine"
+  #   type: continuous
+  #   min: 0.5
+  #   max: 4.0
+  #   encoding: "log_ratio"
+
   # ── Variables categorielles — encodage one-hot classique ─────────────────
   # Utiliser quand les proprietes physicochimiques ne sont pas pertinentes
-  # (ligand de structure tres differente, categorie sans gradient chimique)
+  # (categorie sans gradient chimique exploitable).
   #
   # - name: "Base"
   #   type: categorical
   #   categories: ["K2CO3", "Cs2CO3", "Et3N", "DBU", "DIPEA"]
 
   # ── Variables categorielles — encodage physicochimique (RECOMMANDE) ──────
-  # Le GP utilise les proprietes numeriques au lieu d un one-hot encoding.
+  # Le GP utilise les proprietes numeriques au lieu d'un one-hot encoding.
   # Avantage : le GP comprend que DMF et DMAc sont similaires (epsilon proche)
   # et peut interpoler / extrapoler a de nouveaux solvants non encore testes.
   #
-  # descriptors_file    : chemin vers le fichier Excel (relatif au YAML)
-  # descriptors_sheet   : nom de la feuille (Solvants / Bases / Ligands)
+  # FORMAT FICHIER (v3.8 : auto-detection CSV ou XLSX selon extension)
+  # descriptors_file    : chemin vers le fichier (relatif au YAML)
+  #                       .xlsx pour Excel multi-feuilles
+  #                       .csv  pour CSV simple
+  # descriptors_sheet   : nom de la feuille (uniquement pour XLSX)
   # descriptors_columns : colonnes a utiliser comme features GP
   #
-  # Recommandations par type :
+  # WORKFLOW POUR GENERER LES DESCRIPTEURS :
+  #   - clean_chemdraw_paste.py  : nettoie un paste ChemDraw casse
+  #   - compute_descriptors.py   : calcule descripteurs RDKit + xTB + Mordred
+  #   - enrich_descriptors.py    : enrichit XLSX bibliotheque litterature
+  #   Voir README_descripteurs.md pour le workflow complet.
+  #
+  # ATTENTION : le SMILES Xantphos dans descripteurs_chimiques.xlsx est invalide
+  # (valence aberrante). Bon SMILES :
+  # CC1(C)c2cccc(P(c3ccccc3)c3ccccc3)c2Oc2c(P(c3ccccc3)c3ccccc3)cccc21
+  #
+  # RECOMMANDATIONS PAR TYPE :
   #   Solvants : ["ε (25°C)", "μ (D)", "δP (MPa½)", "δH (MPa½)"]
   #   Bases    : ["pKa (H₂O)", "Encombrement"]
   #   Ligands  : ["TEP (cm⁻¹)", "%Vbur (3.5Å)"]
+  #   SMILES   : ["rdk_MW", "rdk_LogP", "rdk_TPSA",
+  #              "xtb_HOMO_eV", "xtb_LUMO_eV"]
+  #
+  # CHOIX NB DESCRIPTEURS : 5-8 max pour 10-30 molecules.
   #
   # - name: "Solvant"
   #   type: categorical
@@ -82,20 +108,6 @@ parameters:
   #   descriptors_file: "descripteurs_chimiques.xlsx"
   #   descriptors_sheet: "Solvants"
   #   descriptors_columns: ["ε (25°C)", "μ (D)", "δP (MPa½)", "δH (MPa½)"]
-
-  # - name: "Base"
-  #   type: categorical
-  #   categories: ["K2CO3", "Cs2CO3", "K3PO4", "Et3N", "DBU", "DIPEA"]
-  #   descriptors_file: "descripteurs_chimiques.xlsx"
-  #   descriptors_sheet: "Bases"
-  #   descriptors_columns: ["pKa (H₂O)", "Encombrement"]
-
-  # - name: "Ligand"
-  #   type: categorical
-  #   categories: ["PPh3", "PCy3", "PtBu3", "SPhos", "XPhos", "IPr"]
-  #   descriptors_file: "descripteurs_chimiques.xlsx"
-  #   descriptors_sheet: "Ligands"
-  #   descriptors_columns: ["TEP (cm⁻¹)", "%Vbur (3.5Å)"]
 
 
 # == VARIABLES DE SORTIE (OBJECTIFS) ==========================================
@@ -105,9 +117,17 @@ outputs:
   - name: "Rendement (%)"
     direction: maximize
     weight: 1.0
-    # threshold: 70    # <- decommentez pour le mode threshold
+    max: 100             # IMPORTANT : aide autopilot a calibrer la target
+    # threshold: 70    # <- decommenter pour le mode threshold
 
-  # Exemples d'autres sorties (decommentez si besoin) :
+    # ── Utilite non-lineaire (v3.7c) ──────────────────────────────────────
+    # "linear" (defaut) | "log" | "sqrt"
+    # utility_threshold : seuil au-dessus duquel l'utilite s'applique.
+    # Ignore pour direction=minimize.
+    # utility: "linear"
+    # utility_threshold: 60
+
+  # Exemples d'autres sorties (decommenter si besoin) :
   # - name: "ee (%)"
   #   direction: maximize
   #   weight: 0.5
@@ -118,70 +138,151 @@ outputs:
   #   # threshold: 5
 
 
+# == NOISE PRIOR (top-level, hors bo_settings) =================================
+# Prior de bruit transmis au GP pour le terme white noise.
+# "auto"   : detection selon CV des resultats. CV>15% -> medium, CV>30% -> high.
+# "low"    : GammaPrior(1.1, 0.05) — defaut historique. Pour donnees propres.
+# "medium" : GammaPrior(2.0, 0.15) — accepte CV ~5-15%. Bench classique.
+# "high"   : GammaPrior(2.5, 0.5)  — donnees tres bruitees.
+#
+# IMPORTANT : pour des campagnes catégorielles, l'auto-detection peut etre
+# trompée (CV de 8 points init avec yields varies > 30%, declenche "high"
+# alors que c'est variance signal, pas bruit). Forcer "low" est plus sur.
+noise_prior: "low"
+
+
+# == KERNEL GP (top-level, hors bo_settings) ===================================
+# "matern"    : Matern 5/2 ARD standard (defaut)
+# "composite" : additif + multiplicatif (k_all + k_cont * k_cat).
+#               +20-30% vitesse convergence si interaction param continu × cat.
+#               Cout : fit ~2x plus lent. Recommande si ≥1 categoriel.
+kernel: "matern"
+
+
 # == PARAMETRES DE L'OPTIMISATION BAYESIENNE ==================================
 
 bo_settings:
 
-  n_suggestions: 2
+  # ── Parametres de base ─────────────────────────────────────────────────────
+  n_suggestions: 2          # Nb de suggestions par tour (batch)
   seed: 42
-  min_initial_points: 6
 
-  # ── Fonction d'acquisition ────────────────────────────────────────────────
+  # min_initial_points: 6   # Defaut auto : max(5, 3*n_continus + n_categoriels)
+
+  # ── Autopilot v3.8 — orchestration adaptative ─────────────────────────────
+  # Suit la trajectoire de la campagne et bascule entre 3 phases :
+  #   EARLY (progress < 0.7)  : exploration moderee (EI xi=0.05 ou UCB)
+  #   MID   (0.7 ≤ p < 0.95)  : equilibre (EI xi=0.02 ou EI-TS si peu coverage)
+  #   LATE  (progress ≥ 0.95) : affinage strict (EI xi=0.005 ou EI-TS)
   #
-  # "EI"       Expected Improvement
-  #            Recommande par defaut. Bon equilibre exploration/exploitation.
-  #            Parametre : xi (0.0 = exploitation pure, 0.1 = exploration)
+  # Si autopilot: true, l'option "acquisition" plus bas est IGNOREE.
+  # L'autopilot choisit lui-meme l'acquisition selon la phase.
+  autopilot: true
+  autopilot_target: 95          # Yield cible (%). Hautement recommande explicite.
+                                # "auto" possible mais buggy si yields < 50.
+                                # Si max specifie dans outputs, peut etre omis.
+  autopilot_max_iter: 30        # Nb iters BO total prevu pour calculer phases.
+  autopilot_verbose: false      # true = log les decisions iter par iter
+  autopilot_log_transitions: false  # log dans CSV les changements de phase
+
+  # ── Override d'acquisition par phase (v3.8) ───────────────────────────────
+  # Permet de forcer une acquisition specifique pour UNE phase donnee, sans
+  # desactiver l'autopilot. L'override n'agit que dans la phase concernee.
   #
-  # "TEI"      Tempered Expected Improvement (Lavayssiere, Bantreil, Lamaty 2026)
-  #            EI modifie par un facteur g(x,β) qui supprime l exploration
-  #            dans les zones deja bien exploitees (mu proche de y_best).
-  #            Advantage sur paysage multi-modal (plusieurs maxima locaux) :
-  #            evite de rester piege, continue d ameliorer quand EI stagne.
-  #            Recommande apres 10-15 iterations. Avant : EI suffit.
-  #            Parametres : xi (comme EI) + tei_beta (default 8, ne pas changer)
+  # Exemples :
+  # autopilot_acquisition_late: "TEI"     # tester TEI uniquement en LATE
+  # autopilot_acquisition_early: "TEI"    # ou en EARLY
+  # autopilot_acquisition_mid: "UCB"      # ou en MID
+
+  # ── Fonction d'acquisition (UTILISE UNIQUEMENT SI autopilot: false) ───────
   #
-  # "UCB"      Upper Confidence Bound
-  #            Controle via ucb_kappa. kappa eleve = plus d'exploration.
+  # "EI"       Expected Improvement — defaut recommande. Equilibre exp/expl.
+  #            Parametre : xi (0.0=exploitation pure, 0.1=exploration)
+  #
+  # "TEI"      Tempered EI (Lavayssiere, Bantreil, Lamaty 2026)
+  #            EI modifie par g(x,β) qui supprime exploration des zones
+  #            deja exploitees (mu proche de y_best). Recommande sur
+  #            paysage continu lisse (validation : domine sur Branin).
+  #            Parametres : xi + tei_beta (default 8, ne pas changer)
+  #
+  # "UCB"      Upper Confidence Bound. kappa eleve = plus d'exploration.
   #            kappa=0.2 = exploitation pure  |  kappa=2.0 = equilibre
   #
-  # "PI"       Probability of Improvement — conservateur, petites ameliorations.
+  # "PI"       Probability of Improvement. Conservateur, petites ameliorations.
   #
-  # "Thompson" Thompson Sampling — recommande pour les batchs (n >= 2).
-  #            Declenche automatiquement en cas de stagnation.
+  # "Thompson" Thompson Sampling. Recommande pour batchs (n >= 2).
   #
-  # GUIDE PRATIQUE :
-  #   iterations 1-10  : EI  (GammaPriors stabilisent les hyperparametres, tout fonctionne)
-  #   iterations 10+   : TEI (commence a differencier les zones exploitees)
-  #   batch n >= 3     : EI-TS (plus rapide que Kriging Believer, diversite TS)
-  #   exploration auto : UCB-AUTO (beta auto-calibre, pas de kappa a regler)
-  #   exploration pure : VARMAX (maximise la variance, utile si stagnation forcee)
-  #   stagnation auto  : Thompson + n=3
-  #   derive auto      : UCB kappa=0.2
+  # "EI-TS"    Hybride 2/3 EI + 1/3 TS. Validation : meilleur sur Buchwald
+  #            (mixte continu+categoriel) en MID/LATE phases.
+  #
+  # "KG"       Knowledge Gradient exact. Optimal mais lent (~30s/suggestion).
+  #            Phase finale d'affinage uniquement.
+  #
+  # "HEDGE"    GP-Hedge portfolio. Auto-selection EI / UCB-AUTO / TEI selon
+  #            historique de gains. Auto-active si acquisition non specifiee
+  #            ET n_obs >= 15.
+  #
+  # GUIDE PRATIQUE (resultats screen 16h, 5 benchmarks, 5 seeds) :
+  #   continu lisse              : TEI domine
+  #   mixte (continu+categoriel) : EI en EARLY, EI-TS en MID/LATE
+  #   bruite (CV>10%)             : EI-TS partout (robuste)
+  #   batch n >= 3                : EI-TS
+  #   stagnation                  : auto-switch via auto_xi (ci-dessous)
   acquisition: "EI"
   ucb_kappa: 2.0
   xi: 0.01
 
-  # ── Parametres TEI (uniquement si acquisition = "TEI") ───────────────────
-  # tei_beta: 8          # Facteur de temperage. Valeur du papier, ne pas changer.
+  # tei_beta: 8                   # Tempered EI (ne pas changer)
+  # kg_n_fantasy: 32              # KG (defaut OK)
+  # hedge_eta: 1.0                # GP-Hedge softmax temperature
+
+  # ── Auto-tuning de xi (v3.7d) ─────────────────────────────────────────────
+  # Augmente xi automatiquement si stagnation. Force exploration.
+  # Auto-actif par defaut. Inutile si autopilot=true (qui fait la meme chose
+  # mais mieux car contextuel par phase).
+  auto_xi: true
+  xi_stagnation_threshold: 3
+
+  # ── Strategie de batch ────────────────────────────────────────────────────
+  # "qei"              : default v3.8. Parallel EI Monte Carlo. Recommande.
+  # "kriging_believer" : refit GP avec phantom apres chaque suggestion.
+  # "local_penalization": Gonzalez 2016. Penalise l'acq autour des choisis.
+  #                       Plus rapide pour grands batches (n >= 3).
+  # batch_strategy: "qei"
+  # qei_n_samples: 512
+
+  # ── TuRBO trust region (v3.7d) ────────────────────────────────────────────
+  # Auto-actif si n_dims >= 5 ET n_obs >= 10. Trust region adaptative.
+  # use_turbo: true / false
+
+  # ── SAASBO (v3.7d, opt-in) ────────────────────────────────────────────────
+  # Sparse Axis-Aligned Subspace BO. Haute dim (>=6 params) avec peu de
+  # variables actives. Necessite : conda install -c conda-forge pyro-ppl
+  # use_saasbo: true
+  # saasbo_tau: 0.1
+  # saasbo_warmup: 256
+  # saasbo_samples: 256
 
   # ── Mode multi-objectif ───────────────────────────────────────────────────
-  #
-  # "weighted_sum" : somme ponderee des sorties (poids definis dans outputs)
+  # "weighted_sum" : somme ponderee des sorties (poids dans outputs)
   # "pareto"       : front de Pareto sans poids a priori (ParEGO)
   # "threshold"    : contrainte sur certaines sorties avant optimisation
-  # "ehvi"         : MC-EHVI, theoriquement superieur a pareto (3+ objectifs)
-  #                  plus lent (~5-90s/suggestion selon nombre d'objectifs)
+  # "ehvi"         : MC-EHVI, pour 2-3 objectifs (~5-90s/suggestion)
   multi_objective_mode: "weighted_sum"
+
+  # mo_acquisition: "ehvi"        # "ehvi" ou "qnehvi" (batch>=2 + bruit fort)
+  # ehvi_n_mc: 64                 # 32 = rapide  |  128 = rigoureux
+  # qnehvi_n_grid: 2000           # taille grille MC qNEHVI
+  # ref_point:
+  #   - 0.0
+  #   - 0.0
 
   # ── Qualite de l'optimisation ─────────────────────────────────────────────
   # n_restarts : restarts de l'optimiseur local apres recherche globale
   #   20 = rapide  |  50 = rigoureux (recommande)
-  # Note : l'optimiseur global (differential_evolution) tourne toujours,
-  # independamment de n_restarts.
   n_restarts: 50
 
   # ── Convergence ───────────────────────────────────────────────────────────
-  # Rounds consecutifs sans amelioration avant de declarer la convergence.
   convergence_patience: 5
 
   # ── Detection automatique de blocages ────────────────────────────────────
@@ -193,75 +294,112 @@ bo_settings:
   drift_patience: 3
   drift_slope_threshold: 0.03
 
-  # ── Normalisation MinMax de la sortie ────────────────────────────────────
-  # Recommande quand la distribution des rendements est asymetrique
-  # (beaucoup de valeurs basses, peu de valeurs hautes).
-  # Preserve le gradient vers l'optimum (contrairement a log1p).
-  # Desactive normalize_y=True interne du GP pour eviter la double compression.
+  # ── Normalisation Box-Cox de la sortie ────────────────────────────────────
+  # Utile quand distribution rendements asymetrique.
+  # Preserve gradient vers optimum (vs log1p).
+  # Desactive normalize_y interne du GP (evite double compression).
   boxcox: true
 
   # ── Diversity filter (batch n >= 2) ─────────────────────────────────────
-  # Impose une distance minimale entre les suggestions du batch.
-  # Evite que n suggestions se regroupent autour du meme maximum local.
-  # Source : select_top_diverse_candidates (Lavayssiere et al. 2026)
+  # Distance minimale entre suggestions du batch.
+  # Source : Lavayssiere et al. 2026
   diversity_filter: true
-  diversity_min_dist: 0.10   # Distance minimale normalisee [0,1] (0.10 pour n=2)
+  diversity_min_dist: 0.10
+  # diversity_n_grid: 3000
+  # kmeans_n_candidates: 10000
 
-  # ── Domain reduction (DESACTIVE par defaut — risque de maxima locaux) ───
-  # Resserre progressivement les bornes autour du meilleur point trouve.
-  # DANGER : si le meilleur point est un maximum local, le domaine va se
-  # restreindre autour de lui et l optimum global devient inaccessible.
-  # N utiliser qu en phase d affinage (> 15 iterations, bassin confirme).
+  # ── Batch intelligent (v3.5) ──────────────────────────────────────────────
+  # Reduit batch automatiquement si suggestions redondantes.
+  # Override : si stagnation, force batch complet (diversite voulue).
+  smart_batch: true
+  smart_batch_min_dist: 0.08
+
+  # ── Domain reduction (DESACTIVE par defaut) ───────────────────────────────
+  # DANGER : si meilleur point = max local, le domaine se restreint dessus
+  # et l'optimum global devient inaccessible. Phase d'affinage uniquement.
   domain_reduction: false
-  # reduction_factor: 0.8        # Resserre de 20% par iteration
-  # reduction_start_iter: 15     # Ne demarre pas avant cette iteration BO
-  # reduction_min_range: 0.30    # Plage minimale = 30% de la plage initiale
+  # reduction_factor: 0.8
+  # reduction_start_iter: 15
+  # reduction_min_range: 0.30
 
   # ── Detection multi-modale ────────────────────────────────────────────────
-  # Detecte si l'espace d'acquisition a plusieurs zones prometteuses.
-  # Affiche les optima alternatifs dans le terminal (ne les force pas).
+  # Detecte plusieurs zones prometteuses dans l'acquisition.
+  # Affiche les optima alternatifs (ne les force pas).
   multimodal_detection: true
 
   # ── Detection d'outliers ──────────────────────────────────────────────────
-  # Detecte les mesures experimentales aberrantes (residus GP > 3 sigma).
-  # Desactive par defaut (couteux : N fits GP supplementaires).
+  # Detecte mesures aberrantes (residus GP > 3 sigma).
+  # Couteux (N fits GP supplementaires).
   # outlier_detection: false
   # outlier_n_sigma: 3.0
 
   # ── Benchmark (lance avec --benchmark) ───────────────────────────────────
-  # Compare EI / UCB / PI / Thompson / Random sur vos donnees existantes.
   benchmark_n_iter: 10
   benchmark_n_rep: 5
+
+  # ── LHS / DOE (lance avec --init-doe) ─────────────────────────────────────
+  # doe_n_points: 9          # auto si absent : 2 × n_continus + 1
+  # init_method: "lhs"       # "lhs" (defaut) ou "kmeans"
 
   # ── Options graphiques ────────────────────────────────────────────────────
   # colorblind_mode: true    # palette dalton-friendly (Wong 2011)
   # fig_dpi: 150             # 150 = defaut  |  200 = publication
   # fig_width: 14            # largeur en pouces
-  # timestamp_outputs: false # true = horodatage dans les noms de fichiers
+  # timestamp_outputs: false # true = horodatage dans noms de fichiers
 
-  # ── EHVI (uniquement si multi_objective_mode = "ehvi") ────────────────────
-  # ehvi_n_mc: 64            # 32 = rapide  |  128 = rigoureux
-  # ref_point:
-  #   - 0.0
-  #   - 0.0
 
-  # ── LHS — points initiaux (lance avec --init-doe) ─────────────────────────
-  # doe_n_points: 9          # N auto si absent (2 x nb_params_continus + 1)
-  # init_method: "lhs"       # "lhs" (defaut) ou "kmeans"
-  #   lhs    : Latin Hypercube — uniforme, rapide, recommande en general
-  #   kmeans : clustering sur espace encode — meilleur si variables categorielles
-  #            encodees physicochimiquement (solvants, ligands)
+# ═══════════════════════════════════════════════════════════════════════════
+# CONTRAINTES DE FAISABILITE (v3.7, optionnel, top-level)
+# ═══════════════════════════════════════════════════════════════════════════
+# Expressions Python evaluees sur chaque candidat. Points violant exclu avant
+# maximisation. Operateurs : and, or, not, ==, !=, <, >, <=, >=.
+# Noms de variables = noms des parametres du YAML.
+#
+# constraints:
+#   - "solvent != 'H2O' or T < 100"       # eviter H2O > pt ebullition
+#   - "not (T > 80 and t > 120)"          # eviter conditions dures prolongees
+#   - "eq > 1.0 or base == 'DBU'"         # forcer exces sauf avec DBU
 
-  # ── Encodage physicochimique (variables catégorielles) ───────────────────
-  # Si descriptors_file est spécifié pour une variable catégorielle dans
-  # la section parameters, le GP encode les catégories avec leurs valeurs
-  # physicochimiques au lieu d'un one-hot encoding.
-  # Le fichier descripteurs_chimiques.xlsx est fourni avec le script.
-  #
-  # Exemple dans la section parameters :
-  #   - name: "Solvant"
-  #     type: categorical
-  #     categories: ["DMF", "THF", "MeCN"]
-  #     descriptors_file: "descripteurs_chimiques.xlsx"
-  #     descriptors_sheet: "Solvants"
-  #     descriptors_columns: ["ε (25°C)", "μ (D)", "δP (MPa½)", "δH (MPa½)"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONTRAINTES SOFT (cBO, v3.7d, optionnel, top-level)
+# ═══════════════════════════════════════════════════════════════════════════
+# Un GP par contrainte, l'acquisition est multipliee par P(c respectee).
+#
+# soft_constraints:
+#   - name: "Stabilite thermique"
+#     output: "tar_formed"        # nom d'une colonne du CSV
+#     direction: "minimize"       # ou "maximize"
+#     threshold: 5
+#   - name: "Selectivite minimale"
+#     output: "ee"
+#     direction: "maximize"
+#     threshold: 80
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PRIOR KNOWLEDGE INJECTION (v3.7, optionnel, top-level)
+# ═══════════════════════════════════════════════════════════════════════════
+# Injecter des connaissances physico-chimiques a priori dans le GP.
+# GP apprend les residus par rapport au prior -> convergence plus rapide.
+#
+# Types : "none" (defaut), "linear", "threshold"
+#
+# prior_mean:
+#   type: "linear"
+#   params:
+#     intercept: 50.0
+#     coeffs:
+#       T: 20.0      # +20 points de yield entre T_min et T_max (norm)
+#       eq: 10.0     # +10 points pour la plage complete d'equivalents
+#
+# prior_mean:
+#   type: "threshold"
+#   params:
+#     variable: "T"
+#     threshold: 50.0   # seuil en valeur physique
+#     below: 20.0       # prior si T < 50
+#     above: 70.0       # prior si T >= 50
+#
+# prior_mean:
+#   type: "none"

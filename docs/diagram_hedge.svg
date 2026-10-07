@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="460" viewBox="0 0 680 460">
+  <title>GP-Hedge portfolio selection</title>
+  <desc>Schema du portfolio GP-Hedge : a chaque iteration, EI/UCB-AUTO/TEI proposent un point ; un bandit softmax choisit lequel executer ; tous les acquireurs accumulent du gain selon le mu predit a leur point propose.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { font-family: Arial, sans-serif; }
+      .th { font-size: 14px; font-weight: 500; }
+      .ts { font-size: 12px; fill: #555; }
+      .arr { stroke: #555; stroke-width: 1.5; fill: none; }
+      .c-gray rect { fill: #F1EFE8; stroke: #5F5E5A; }
+      .c-gray text { fill: #2C2C2A; }
+      .c-blue rect { fill: #E6F1FB; stroke: #185FA5; }
+      .c-blue text { fill: #0C447C; }
+      .c-purple rect { fill: #EEEDFE; stroke: #534AB7; }
+      .c-purple text { fill: #3C3489; }
+      .c-teal rect { fill: #E1F5EE; stroke: #0F6E56; }
+      .c-teal text { fill: #085041; }
+      .c-amber rect { fill: #FAEEDA; stroke: #854F0B; }
+      .c-amber text { fill: #633806; }
+      .c-coral rect { fill: #FAECE7; stroke: #993C1D; }
+      .c-coral text { fill: #4A1B0C; }
+    </style>
+  </defs>
+
+  <g class="c-gray">
+    <rect x="240" y="30" width="200" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="55" text-anchor="middle">Gaussian process</text>
+    <text class="ts" x="340" y="73" text-anchor="middle">mu(x), sigma(x)</text>
+  </g>
+  <g class="c-blue">
+    <rect x="60" y="140" width="160" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="140" y="165" text-anchor="middle">EI</text>
+    <text class="ts" x="140" y="183" text-anchor="middle">propose x_EI</text>
+  </g>
+  <g class="c-purple">
+    <rect x="260" y="140" width="160" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="165" text-anchor="middle">UCB-AUTO</text>
+    <text class="ts" x="340" y="183" text-anchor="middle">propose x_UCB</text>
+  </g>
+  <g class="c-teal">
+    <rect x="460" y="140" width="160" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="540" y="165" text-anchor="middle">TEI</text>
+    <text class="ts" x="540" y="183" text-anchor="middle">propose x_TEI</text>
+  </g>
+  <g class="c-amber">
+    <rect x="180" y="240" width="320" height="64" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="267" text-anchor="middle">Softmax bandit</text>
+    <text class="ts" x="340" y="287" text-anchor="middle">P(acq_i) ∝ exp(eta × gain_cumule_i)</text>
+  </g>
+  <g class="c-coral">
+    <rect x="240" y="354" width="200" height="56" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="379" text-anchor="middle">Acq choisie</text>
+    <text class="ts" x="340" y="397" text-anchor="middle">execute son x_propose</text>
+  </g>
+
+  <line x1="280" y1="86" x2="160" y2="135" class="arr" marker-end="url(#arrow)"/>
+  <line x1="340" y1="86" x2="340" y2="135" class="arr" marker-end="url(#arrow)"/>
+  <line x1="400" y1="86" x2="520" y2="135" class="arr" marker-end="url(#arrow)"/>
+  <line x1="160" y1="196" x2="260" y2="237" class="arr" marker-end="url(#arrow)"/>
+  <line x1="340" y1="196" x2="340" y2="237" class="arr" marker-end="url(#arrow)"/>
+  <line x1="520" y1="196" x2="420" y2="237" class="arr" marker-end="url(#arrow)"/>
+  <line x1="340" y1="304" x2="340" y2="349" class="arr" marker-end="url(#arrow)"/>
+  <path d="M620 380 L660 380 L660 58 L445 58" class="arr" marker-end="url(#arrow)" stroke-dasharray="4 3" opacity="0.6"/>
+  <text class="ts" x="650" y="220" text-anchor="middle">gain += mu(x)</text>
+</svg>

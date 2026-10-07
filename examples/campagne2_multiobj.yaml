@@ -1,0 +1,24 @@
+campaign_name: suzuki_multiobj
+parameters:
+  - name: Temperature
+    type: continuous
+    min: 40
+    max: 110
+  - name: Loading catalyseur
+    type: continuous
+    min: 1
+    max: 8
+outputs:
+  - name: Rendement (%)
+    direction: maximize
+    weight: 0.6
+    max: 100
+  - name: Cout
+    direction: minimize
+    weight: 0.4
+noise_prior: low
+bo_settings:
+  n_suggestions: 1
+  multi_objective_mode: ehvi
+  mo_acquisition: ehvi
+  autopilot: false

@@ -1,0 +1,19 @@
+# Coeur — optimisation bayesienne
+numpy>=1.24,<2
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+pyyaml>=6.0
+matplotlib>=3.7
+
+# Gaussian Process (moteur BO principal)
+torch>=2.0
+gpytorch>=1.11
+
+# Interface desktop
+pywebview>=4.4
+
+# Optionnel — descripteurs moleculaires (decommenter si besoin)
+# rdkit>=2023.3
+# mordredcommunity>=2.0
+# morfeus-ml>=0.7
