@@ -44,6 +44,8 @@ rendement (ou tout autre objectif) cible en un minimum d'expériences.
   suggestions, visualisation de la convergence et de la fonction
   d'acquisition, récapitulatif du coût expérimental avant lancement, le tout
   hors-ligne.
+- **Interface en français ou en anglais** : sélecteur dans la barre latérale,
+  choix mémorisé localement (`settings.json`).
 
 ## Stack technique
 

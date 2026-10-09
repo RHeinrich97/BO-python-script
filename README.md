@@ -20,6 +20,7 @@ The goal: suggest the most promising experimental conditions to test next, based
 - **Adjustable measurement reliability**: the GP noise prior follows the declared analytical precision, so the model does not smooth away a real peak as if it were noise.
 - **Dimension-aware initial design**: the size of the LHS design accounts for continuous variables and categorical levels, with a maximin criterion for coverage.
 - **Desktop interface**: campaign creation, result entry, suggestions, convergence and acquisition plots, summary of the experimental cost before launch, all offline.
+- **English or French interface**: language switch in the sidebar, choice remembered locally (`settings.json`).
 
 ## Tech stack
 

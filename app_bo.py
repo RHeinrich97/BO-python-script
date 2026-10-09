@@ -31,6 +31,8 @@ import json
 import shutil
 import re
 import contextlib
+import functools
+import inspect
 import traceback
 from pathlib import Path
 
@@ -56,16 +58,16 @@ DESC_LIBRARY = APP_DIR / "examples" / "descripteurs_chimiques.xlsx"
 
 # Variables continues classiques : (nom, unite, placeholder_min, placeholder_max)
 CONTINUOUS_PRESETS = [
-    {"name": "Temperature",        "unit": "C",      "ph_min": 25,   "ph_max": 150, "log_ok": False},
-    {"name": "Temps (min)",        "unit": "",       "ph_min": 15,   "ph_max": 240, "log_ok": False},
-    {"name": "Temps (h)",          "unit": "",       "ph_min": 0.5,  "ph_max": 24,  "log_ok": False},
-    {"name": "Equivalents",        "unit": "eq",     "ph_min": 1.0,  "ph_max": 3.0, "log_ok": True},
-    {"name": "Concentration",      "unit": "M",      "ph_min": 0.05, "ph_max": 1.0, "log_ok": True},
-    {"name": "Loading catalyseur", "unit": "mol%",   "ph_min": 0.5,  "ph_max": 10,  "log_ok": True},
-    {"name": "Pression",           "unit": "bar",    "ph_min": 1,    "ph_max": 50,  "log_ok": False},
-    {"name": "Debit",              "unit": "mL/min", "ph_min": 0.1,  "ph_max": 5.0, "log_ok": True},
-    {"name": "pH",                 "unit": "",       "ph_min": 1,    "ph_max": 14,  "log_ok": False},
-    {"name": "Ratio reactifs (A/B)", "unit": "",     "ph_min": 0.5,  "ph_max": 2.0, "log_ok": True},
+    {"name": "Temperature",        "name_en": "Temperature",         "unit": "C",      "ph_min": 25,   "ph_max": 150, "log_ok": False},
+    {"name": "Temps (min)",        "name_en": "Time (min)",          "unit": "",       "ph_min": 15,   "ph_max": 240, "log_ok": False},
+    {"name": "Temps (h)",          "name_en": "Time (h)",            "unit": "",       "ph_min": 0.5,  "ph_max": 24,  "log_ok": False},
+    {"name": "Equivalents",        "name_en": "Equivalents",         "unit": "eq",     "ph_min": 1.0,  "ph_max": 3.0, "log_ok": True},
+    {"name": "Concentration",      "name_en": "Concentration",       "unit": "M",      "ph_min": 0.05, "ph_max": 1.0, "log_ok": True},
+    {"name": "Loading catalyseur", "name_en": "Catalyst loading",    "unit": "mol%",   "ph_min": 0.5,  "ph_max": 10,  "log_ok": True},
+    {"name": "Pression",           "name_en": "Pressure",            "unit": "bar",    "ph_min": 1,    "ph_max": 50,  "log_ok": False},
+    {"name": "Debit",              "name_en": "Flow rate",           "unit": "mL/min", "ph_min": 0.1,  "ph_max": 5.0, "log_ok": True},
+    {"name": "pH",                 "name_en": "pH",                  "unit": "",       "ph_min": 1,    "ph_max": 14,  "log_ok": False},
+    {"name": "Ratio reactifs (A/B)", "name_en": "Reagent ratio (A/B)", "unit": "",     "ph_min": 0.5,  "ph_max": 2.0, "log_ok": True},
 ]
 
 # Pour chaque feuille de la bibliotheque : les 5 descripteurs les plus
@@ -83,6 +85,166 @@ CATEGORICAL_PRESETS = {
     "Base":    "Bases",
     "Ligand":  "Ligands",
 }
+CATEGORICAL_LABELS_EN = {"Solvant": "Solvent", "Base": "Base", "Ligand": "Ligand"}
+
+# =============================================================================
+# LANGUE DE L'INTERFACE (FR / EN)
+# =============================================================================
+# Les messages du backend sont ecrits en francais ; en mode "en" ils sont
+# traduits au moment ou ils sont renvoyes au JS (voir _localize_api).
+SETTINGS_FILE = APP_DIR / "settings.json"
+UI_LANG = "fr"
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data):
+    tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SETTINGS_FILE)
+
+
+_saved_lang = load_settings().get("language")
+if _saved_lang in ("fr", "en"):
+    UI_LANG = _saved_lang
+
+# (motif francais, gabarit anglais). Correspondance exacte (fullmatch) ;
+# les groupes captures sont eux-memes traduits (messages imbriques).
+EN_MESSAGES = [
+    (r"Nom requis", "Name required"),
+    (r"Nom trop long \(max 80 caracteres\)", "Name too long (max 80 characters)"),
+    (r"Caracteres interdits dans le nom : (.*)", "Forbidden characters in the name: {0}"),
+    (r"Nom invalide \(chemin\)", "Invalid name (path)"),
+    (r"Nom invalide", "Invalid name"),
+    (r"Au moins un parametre requis", "At least one parameter required"),
+    (r"Tout parametre doit avoir un nom", "Every parameter needs a name"),
+    (r"Nom de parametre duplique : '(.*)'", "Duplicate parameter name: '{0}'"),
+    (r"Parametre '(.*)' : min et max requis", "Parameter '{0}': min and max required"),
+    (r"Parametre '(.*)' : min \((.*)\) doit etre < max \((.*)\)",
+     "Parameter '{0}': min ({1}) must be < max ({2})"),
+    (r"Parametre '(.*)' : au moins 2 categories requises",
+     "Parameter '{0}': at least 2 categories required"),
+    (r"Parametre '(.*)' : categories dupliquees", "Parameter '{0}': duplicate categories"),
+    (r"Parametre '(.*)' : descriptors_file fourni mais aucune colonne selectionnee",
+     "Parameter '{0}': descriptors_file given but no column selected"),
+    (r"Parametre '(.*)' : trop de descripteurs \((\d+)\), max 8 recommande pour eviter "
+     r"un GP sous-determine",
+     "Parameter '{0}': too many descriptors ({1}), max 8 recommended to avoid an "
+     "underdetermined GP"),
+    (r"Parametre '(.*)' : type inconnu '(.*)'", "Parameter '{0}': unknown type '{1}'"),
+    (r"Au moins un objectif requis", "At least one objective required"),
+    (r"Tout objectif doit avoir un nom", "Every objective needs a name"),
+    (r"Objectif duplique : '(.*)'", "Duplicate objective: '{0}'"),
+    (r"Objectif '(.*)' : direction doit etre maximize ou minimize",
+     "Objective '{0}': direction must be maximize or minimize"),
+    (r"Objectif '(.*)' : poids doit etre > 0", "Objective '{0}': weight must be > 0"),
+    (r"Objectif '(.*)' : poids invalide", "Objective '{0}': invalid weight"),
+    (r"Un parametre et un objectif ont le meme nom : (.*)",
+     "A parameter and an objective have the same name: {0}"),
+    (r"Contrainte vide", "Empty constraint"),
+    (r"Contrainte invalide : '(.*)' \((\w+)\)\. Verifie les noms de parametres\.",
+     "Invalid constraint: '{0}' ({1}). Check the parameter names."),
+    (r"Contrainte soft sans 'output'", "Soft constraint without 'output'"),
+    (r"Contrainte soft : l'objectif '(.*)' n'existe pas\. Objectifs disponibles : (.*)",
+     "Soft constraint: objective '{0}' does not exist. Available objectives: {1}"),
+    (r"Contrainte soft '(.*)' : direction maximize ou minimize requise",
+     "Soft constraint '{0}': direction maximize or minimize required"),
+    (r"Contrainte soft '(.*)' : seuil numerique requis",
+     "Soft constraint '{0}': numerical threshold required"),
+    (r"Bibliotheque de descripteurs absente", "Descriptor library missing"),
+    (r"Feuille '(.*)' sans colonne Nom", "Sheet '{0}' has no 'Nom' column"),
+    (r"Campagne '(.*)' existe deja", "Campaign '{0}' already exists"),
+    (r"YAML invalide \(pas un dictionnaire\)", "Invalid YAML (not a mapping)"),
+    (r"Cle manquante : (.*)", "Missing key: {0}"),
+    (r"Nom de campagne : (.*)", "Campaign name: {0}"),
+    (r"Impossible de supprimer '(.*)' : un fichier est peut-etre ouvert ailleurs "
+     r"\(Excel, explorateur\)\. Ferme-le et reessaie\.",
+     "Cannot delete '{0}': a file may be open elsewhere (Excel, file explorer). "
+     "Close it and try again."),
+    (r"Echec suppression : (.*)", "Deletion failed: {0}"),
+    (r"Campagne introuvable", "Campaign not found"),
+    (r"'(.*)' existe deja", "'{0}' already exists"),
+    (r"Valeur manquante pour '(.*)'", "Missing value for '{0}'"),
+    (r"'(.*)' doit etre numerique", "'{0}' must be numeric"),
+    (r"'(.*)' = (.*) hors bornes \[(.*)\]", "'{0}' = {1} out of bounds [{2}]"),
+    (r"'(.*)' : '(.*)' n'est pas une categorie valide \((.*)\)",
+     "'{0}': '{1}' is not a valid category ({2})"),
+    (r"(\d+) suggestion\(s\) en attente de resultat\. Remplis-les \(ou utilise "
+     r"'Remplacer'\) avant d'en generer de nouvelles\.",
+     "{0} suggestion(s) waiting for a result. Fill them in (or use 'Replace') "
+     "before generating new ones."),
+    (r"Erreur pendant le calcul\.", "Error during computation."),
+    (r"Le modele GP n'a pas pu s'ajuster \(matrice singuliere\)\. Cela arrive souvent "
+     r"avec trop peu de donnees ou des valeurs quasi identiques\. Ajoute quelques "
+     r"experiences plus variees\.",
+     "The GP model could not be fitted (singular matrix). This often happens with "
+     "too little data or nearly identical values. Add a few more varied experiments."),
+    (r"Memoire insuffisante pour ce calcul\. Reduis n_suggestions\.",
+     "Not enough memory for this computation. Reduce n_suggestions."),
+    (r"L'optimiseur n'a pas converge\. Reessaie, ou ajoute des donnees si le "
+     r"probleme persiste\.",
+     "The optimizer did not converge. Try again, or add data if the problem persists."),
+    (r"Erreur pendant le calcul : (.*)", "Error during computation: {0}"),
+    (r"Au moins 3 experiences requises", "At least 3 experiments required"),
+    (r"Parametre continu requis", "Continuous parameter required"),
+    (r"Pareto necessite >= 2 objectifs", "Pareto needs >= 2 objectives"),
+    (r"Index hors limites", "Index out of range"),
+    (r"Langue inconnue \(fr ou en\)", "Unknown language (fr or en)"),
+    # libelles des badges du log moteur
+    (r"Stagnation detectee", "Stagnation detected"),
+    (r"Drift detecte", "Drift detected"),
+    (r"Convergence atteinte", "Convergence reached"),
+]
+_EN_COMPILED = [(re.compile(p, re.S), t) for p, t in EN_MESSAGES]
+
+
+def tr(msg):
+    """Traduit un message backend vers la langue de l'interface."""
+    if UI_LANG != "en" or not isinstance(msg, str):
+        return msg
+    for pat, tpl in _EN_COMPILED:
+        m = pat.fullmatch(msg)
+        if m:
+            return tpl.format(*[tr(g) for g in m.groups()])
+    return msg
+
+
+def _localize_result(res):
+    if UI_LANG != "en" or not isinstance(res, dict):
+        return res
+    for key in ("error", "msg"):
+        if isinstance(res.get(key), str):
+            res[key] = tr(res[key])
+    for b in res.get("badges") or []:
+        if isinstance(b, dict) and isinstance(b.get("label"), str):
+            b["label"] = tr(b["label"])
+    return res
+
+
+def _localize_api(cls):
+    """Enveloppe chaque methode publique de l'API pour traduire ses messages.
+    __signature__ est conserve : pywebview lit les arguments via
+    inspect.getfullargspec pour generer les fonctions JS."""
+    for name, fn in list(vars(cls).items()):
+        if name.startswith("_") or not inspect.isfunction(fn):
+            continue
+
+        def make(f):
+            @functools.wraps(f)
+            def wrapper(self, *args, **kwargs):
+                return _localize_result(f(self, *args, **kwargs))
+            wrapper.__signature__ = inspect.signature(f)
+            return wrapper
+        setattr(cls, name, make(fn))
+    return cls
 
 MAX_N_SUGGEST = 20
 
@@ -346,10 +508,32 @@ def parse_log_badges(log_text):
 # =============================================================================
 # API EXPOSEE AU JAVASCRIPT
 # =============================================================================
+@_localize_api
 class Api:
     """Chaque methode publique est appelable depuis JS :
     window.pywebview.api.method_name(args).then(result => ...)
     """
+
+    # ── Langue de l'interface ───────────────────────────────────────────────
+    def get_settings(self):
+        """Reglages persistants (settings.json). language = None si jamais choisie."""
+        data = load_settings()
+        lang = data.get("language")
+        return {"ok": True, "language": lang if lang in ("fr", "en") else None}
+
+    def set_language(self, lang):
+        """Change la langue de l'interface et la memorise dans settings.json."""
+        global UI_LANG
+        if lang not in ("fr", "en"):
+            return {"ok": False, "error": "Langue inconnue (fr ou en)"}
+        UI_LANG = lang
+        try:
+            data = load_settings()
+            data["language"] = lang
+            save_settings(data)
+        except Exception as e:
+            return {"ok": True, "language": lang, "warning": str(e)}
+        return {"ok": True, "language": lang}
 
     # ── Presets pour le formulaire de creation ──────────────────────────────
     def get_presets(self):
@@ -363,7 +547,8 @@ class Api:
                 sheets = xl.sheet_names
                 for label, sheet in CATEGORICAL_PRESETS.items():
                     if sheet in sheets:
-                        cat_presets.append({"label": label, "sheet": sheet})
+                        cat_presets.append({"label": label, "sheet": sheet,
+                                            "label_en": CATEGORICAL_LABELS_EN.get(label, label)})
             except Exception:
                 library_ok = False
         return _to_native({
